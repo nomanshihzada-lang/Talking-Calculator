@@ -6,143 +6,62 @@ import "android.content.Context"
 import "android.content.Intent"
 import "android.net.Uri"
 import "android.content.DialogInterface"
-import "android.speech.tts.TextToSpeech"
-import "java.util.Locale"
+import "android.view.accessibility.AccessibilityEvent"
+import "android.view.WindowManager"
+import "android.text.InputType"
+import "android.content.ClipboardManager"
+import "android.content.ClipData"
+import "java.util.Calendar"
 import "com.androlua.*"
 
 -- Global State Management
-local currentInput = ""
-local currentMode = "Basic"
-local unitFrom = "Meters"
-local unitTo = "Kilometers"
 local historyLog = {}
 
--- WhatsApp Support Number
+-- Support Info
 local whatsappNumber = "+923006151134"
 
--- Settings State Management
-local settingSpeechRate = 1.0
-local settingVibrationEnabled = true
-local selectedTtsEnginePackage = ""
-local installedTtsEngines = {}
-local installedTtsEngineNames = {}
+-- Window Screen Settings
+activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
--- Vibration Utility
+-- Vibration Utility (Always Enabled for Accessibility)
 local vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE)
 local function triggerVibration()
-  if settingVibrationEnabled then
-    pcall(function() vibrator.vibrate(40) end)
-  end
+  pcall(function() vibrator.vibrate(40) end)
 end
 
--- Robust Dynamic Text-To-Speech Engine Manager
-local ttsEngine
-
-local function initTtsWithEngine(enginePackage)
-  if ttsEngine then
-    pcall(function() ttsEngine.shutdown() end)
-  end
-
-  local initListener = TextToSpeech.OnInitListener{
-    onInit = function(status)
-      if status == TextToSpeech.SUCCESS then
-        ttsEngine.setLanguage(Locale.getDefault())
-        ttsEngine.setSpeechRate(settingSpeechRate)
-        ttsEngine.speak("Talking Calculator Ready. Created by Hafiz Zeeshan", TextToSpeech.QUEUE_FLUSH, nil)
-      end
-    end
-  }
-
-  if enginePackage and enginePackage ~= "" then
-    ttsEngine = TextToSpeech(activity, initListener, enginePackage)
-  else
-    ttsEngine = TextToSpeech(activity, initListener)
-  end
-end
-
--- Fetch all Installed TTS Engines on the Device
-local function fetchAvailableTtsEngines()
-  installedTtsEngines = {}
-  installedTtsEngineNames = {}
-
-  pcall(function()
-    local dummyTts
-    dummyTts = TextToSpeech(activity, TextToSpeech.OnInitListener{
-      onInit = function(status)
-        if status == TextToSpeech.SUCCESS then
-          local engines = dummyTts.getEngines()
-          if engines then
-            local iterator = engines.iterator()
-            while iterator.hasNext() do
-              local engineInfo = iterator.next()
-              table.insert(installedTtsEngines, tostring(engineInfo.name))
-              table.insert(installedTtsEngineNames, tostring(engineInfo.label))
-            end
-          end
-          dummyTts.shutdown()
-        end
-      end
-    })
-  end)
-
-  if #installedTtsEngineNames == 0 then
-    table.insert(installedTtsEngineNames, "Default System TTS")
-    table.insert(installedTtsEngines, "")
-  end
-end
-
--- Initialize Initial TTS Setup & Get Engine List
-initTtsWithEngine("")
-task(200, function()
-  fetchAvailableTtsEngines()
-end)
-
+-- Universal Screen Reader Native Announcer
 local function speakText(txt)
-  if ttsEngine then
-    local speechStr = tostring(txt)
-    speechStr = speechStr:gsub("%+", " plus ")
-    speechStr = speechStr:gsub("%-", " minus ")
-    speechStr = speechStr:gsub("%*", " multiplied by ")
-    speechStr = speechStr:gsub("/", " divided by ")
-    speechStr = speechStr:gsub("=", " equals ")
-    speechStr = speechStr:gsub("%%", " percent ")
-    speechStr = speechStr:gsub("%.", " point ")
-    speechStr = speechStr:gsub("C", " clear ")
-    speechStr = speechStr:gsub("⌫", " backspace ")
-    
-    ttsEngine.setSpeechRate(settingSpeechRate)
-    ttsEngine.speak(speechStr, TextToSpeech.QUEUE_FLUSH, nil)
+  local speechStr = tostring(txt)
+  speechStr = speechStr:gsub("%+", " plus ")
+  speechStr = speechStr:gsub("%-", " minus ")
+  speechStr = speechStr:gsub("%*", " multiplied by ")
+  speechStr = speechStr:gsub("/", " divided by ")
+  speechStr = speechStr:gsub("=", " equals ")
+  speechStr = speechStr:gsub("%%", " percent ")
+  speechStr = speechStr:gsub("%.", " point ")
+  speechStr = speechStr:gsub("C", " clear ")
+  speechStr = speechStr:gsub("⌫", " backspace ")
+  
+  pcall(function()
+    activity.getWindow().getDecorView().announceForAccessibility(speechStr)
+  end)
+end
+
+-- Clipboard Copy Helper
+local function copyToClipboard(textToCopy)
+  if textToCopy and textToCopy ~= "" and textToCopy ~= "\n" then
+    local clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
+    local clip = ClipData.newPlainText("Calculator Result", textToCopy)
+    clipboard.setPrimaryClip(clip)
+    speakText("Result copied to clipboard")
+  else
+    speakText("Nothing to copy yet")
   end
 end
 
--- Forward declarations for dynamic UI updating
-local screenDisplay, modeIndicatorLabel, keypadGrid
-
--- Result Dialog Box Handler
-local function displayResultDialog(resValue)
-  speakText("Result is " .. resValue)
-  table.insert(historyLog, (currentInput == "" and currentMode or currentInput) .. " = " .. resValue)
-  
-  local resultDlg = LuaDialog(activity)
-  resultDlg.setTitle("Calculation Result")
-  resultDlg.setMessage("Answer:\n\n" .. resValue)
-  
-  resultDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Share", function()
-    local shareIntent = Intent()
-    shareIntent.setAction(Intent.ACTION_SEND)
-    shareIntent.setType("text/plain")
-    shareIntent.putExtra(Intent.EXTRA_TEXT, "Result: " .. resValue .. " (Powered by Talking Calculator - Hafiz Zeeshan)")
-    activity.startActivity(Intent.createChooser(shareIntent, "Share Result Via"))
-  end)
-  
-  resultDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Close", function()
-    speakText("Closed")
-  end)
-  
-  resultDlg.show()
-end
-
--- Advanced Unit Converter Logics
+-- ==========================================
+-- Core Conversion Logics 
+-- ==========================================
 local function convertLength(val, fromU, toU)
   local meters = val
   if fromU == "Kilometers" then meters = val * 1000
@@ -150,8 +69,7 @@ local function convertLength(val, fromU, toU)
   elseif fromU == "Millimeters" then meters = val / 1000
   elseif fromU == "Inches" then meters = val * 0.0254
   elseif fromU == "Feet" then meters = val * 0.3048
-  elseif fromU == "Yards" then meters = val * 0.9144
-  end
+  elseif fromU == "Yards" then meters = val * 0.9144 end
 
   if toU == "Kilometers" then return meters / 1000
   elseif toU == "Centimeters" then return meters * 100
@@ -167,8 +85,7 @@ local function convertWeight(val, fromU, toU)
   if fromU == "Grams" then kg = val / 1000
   elseif fromU == "Milligrams" then kg = val / 1000000
   elseif fromU == "Pounds" then kg = val / 2.20462
-  elseif fromU == "Ounces" then kg = val / 35.274
-  end
+  elseif fromU == "Ounces" then kg = val / 35.274 end
 
   if toU == "Grams" then return kg * 1000
   elseif toU == "Milligrams" then return kg * 1000000
@@ -181,8 +98,7 @@ local function convertTemp(val, fromU, toU)
   if fromU == toU then return val end
   local celsius = val
   if fromU == "Fahrenheit" then celsius = (val - 32) * 5/9
-  elseif fromU == "Kelvin" then celsius = val - 273.15
-  end
+  elseif fromU == "Kelvin" then celsius = val - 273.15 end
 
   if toU == "Fahrenheit" then return (celsius * 9/5) + 32
   elseif toU == "Kelvin" then return celsius + 273.15
@@ -194,8 +110,7 @@ local function convertArea(val, fromU, toU)
   if fromU == "Square Kilometers" then sqMeters = val * 1000000
   elseif fromU == "Square Feet" then sqMeters = val * 0.092903
   elseif fromU == "Square Inches" then sqMeters = val * 0.00064516
-  elseif fromU == "Acres" then sqMeters = val * 4046.86
-  end
+  elseif fromU == "Acres" then sqMeters = val * 4046.86 end
 
   if toU == "Square Kilometers" then return sqMeters / 1000000
   elseif toU == "Square Feet" then return sqMeters / 0.092903
@@ -209,8 +124,7 @@ local function convertData(val, fromU, toU)
   if fromU == "Kilobytes (KB)" then mb = val / 1024
   elseif fromU == "Gigabytes (GB)" then mb = val * 1024
   elseif fromU == "Terabytes (TB)" then mb = val * 1024 * 1024
-  elseif fromU == "Bytes" then mb = val / (1024 * 1024)
-  end
+  elseif fromU == "Bytes" then mb = val / (1024 * 1024) end
 
   if toU == "Kilobytes (KB)" then return mb * 1024
   elseif toU == "Gigabytes (GB)" then return mb / 1024
@@ -223,8 +137,7 @@ local function convertSpeed(val, fromU, toU)
   local kmh = val
   if fromU == "Meters/Sec (m/s)" then kmh = val * 3.6
   elseif fromU == "Miles/Hour (mph)" then kmh = val * 1.60934
-  elseif fromU == "Knots" then kmh = val * 1.852
-  end
+  elseif fromU == "Knots" then kmh = val * 1.852 end
 
   if toU == "Meters/Sec (m/s)" then return kmh / 3.6
   elseif toU == "Miles/Hour (mph)" then return kmh / 1.60934
@@ -236,8 +149,7 @@ local function convertTime(val, fromU, toU)
   local sec = val
   if fromU == "Minutes" then sec = val * 60
   elseif fromU == "Hours" then sec = val * 3600
-  elseif fromU == "Days" then sec = val * 86400
-  end
+  elseif fromU == "Days" then sec = val * 86400 end
 
   if toU == "Minutes" then return sec / 60
   elseif toU == "Hours" then return sec / 3600
@@ -248,260 +160,572 @@ end
 local function convertVolume(val, fromU, toU)
   local ml = val
   if fromU == "Liters" then ml = val * 1000
-  elseif fromU == "US Gallons" then ml = val * 3785.41
-  end
+  elseif fromU == "US Gallons" then ml = val * 3785.41 end
 
   if toU == "Liters" then return ml / 1000
   elseif toU == "US Gallons" then return ml / 3785.41
   else return ml end
 end
 
--- Extended Calculation Dialogs for Special Modes
-local function openFinancialCalcDialog()
-  speakText("Financial Calculator. Enter Principal, Rate, and Time.")
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(35, 35, 35, 35)
+local function convertPower(val, fromU, toU)
+  local watts = val
+  if fromU == "Kilowatts (kW)" then watts = val * 1000
+  elseif fromU == "Horsepower (hp)" then watts = val * 745.7 end
 
-  local editP = EditText(activity)
-  editP.setHint("Principal Amount")
-  editP.setInputType(2)
-  layout.addView(editP)
-
-  local editR = EditText(activity)
-  editR.setHint("Annual Interest Rate (%)")
-  editR.setInputType(2)
-  layout.addView(editR)
-
-  local editT = EditText(activity)
-  editT.setHint("Time (Years)")
-  editT.setInputType(2)
-  layout.addView(editT)
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle("Financial Interest Calculator")
-  dlg.setView(layout)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Calculate", function()
-    local p = tonumber(editP.getText().toString()) or 0
-    local r = tonumber(editR.getText().toString()) or 0
-    local t = tonumber(editT.getText().toString()) or 0
-    local interest = (p * r * t) / 100
-    local total = p + interest
-    displayResultDialog("Interest: " .. tostring(interest) .. "\nTotal Amount: " .. tostring(total))
-  end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Cancel", nil)
-  dlg.show()
+  if toU == "Kilowatts (kW)" then return watts / 1000
+  elseif toU == "Horsepower (hp)" then return watts / 745.7
+  else return watts end
 end
 
-local function openBmiCalcDialog()
-  speakText("BMI Calculator. Enter Weight and Height.")
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(35, 35, 35, 35)
+local function convertPressure(val, fromU, toU)
+  local pascal = val
+  if fromU == "Bar" then pascal = val * 100000
+  elseif fromU == "PSI" then pascal = val * 6894.76
+  elseif fromU == "Atmosphere (atm)" then pascal = val * 101325 end
 
-  local editWeight = EditText(activity)
-  editWeight.setHint("Weight (kg)")
-  editWeight.setInputType(2)
-  layout.addView(editWeight)
-
-  local editHeight = EditText(activity)
-  editHeight.setHint("Height (meters)")
-  editHeight.setInputType(2)
-  layout.addView(editHeight)
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle("BMI Calculator")
-  dlg.setView(layout)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Calculate", function()
-    local w = tonumber(editWeight.getText().toString()) or 0
-    local h = tonumber(editHeight.getText().toString()) or 0
-    if h > 0 then
-      local bmi = w / (h * h)
-      local resStr = string.format("%.2f", bmi)
-      displayResultDialog("BMI: " .. resStr)
-    else
-      displayResultDialog("Invalid Height")
-    end
-  end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Cancel", nil)
-  dlg.show()
+  if toU == "Bar" then return pascal / 100000
+  elseif toU == "PSI" then return pascal / 6894.76
+  elseif toU == "Atmosphere (atm)" then return pascal / 101325
+  else return pascal end
 end
 
-local function openPercentageCalcDialog()
-  speakText("Percentage Calculator.")
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(35, 35, 35, 35)
+local function convertEnergy(val, fromU, toU)
+  local joules = val
+  if fromU == "Calories (cal)" then joules = val * 4.184
+  elseif fromU == "Kilocalories (kcal)" then joules = val * 4184
+  elseif fromU == "Kilowatt-hours (kWh)" then joules = val * 3600000 end
 
-  local editPart = EditText(activity)
-  editPart.setHint("Enter Percentage Value (%)")
-  editPart.setInputType(2)
-  layout.addView(editPart)
-
-  local editTotal = EditText(activity)
-  editTotal.setHint("Enter Total Value")
-  editTotal.setInputType(2)
-  layout.addView(editTotal)
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle("Percentage Calculator")
-  dlg.setView(layout)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Calculate", function()
-    local part = tonumber(editPart.getText().toString()) or 0
-    local total = tonumber(editTotal.getText().toString()) or 0
-    local res = (part / 100) * total
-    displayResultDialog(part .. "% of " .. total .. " = " .. tostring(res))
-  end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Cancel", nil)
-  dlg.show()
+  if toU == "Calories (cal)" then return joules / 4.184
+  elseif toU == "Kilocalories (kcal)" then return joules / 4184
+  elseif toU == "Kilowatt-hours (kWh)" then return joules / 3600000
+  else return joules end
 end
 
--- Core Auto-Calculation Logic
-local function processCalculation()
-  if currentInput == "" then return end
+local function convertAngle(val, fromU, toU)
+  local deg = val
+  if fromU == "Radians" then deg = val * (180 / math.pi)
+  elseif fromU == "Gradians" then deg = val * 0.9 end
+
+  if toU == "Radians" then return deg * (math.pi / 180)
+  elseif toU == "Gradians" then return deg / 0.9
+  else return deg end
+end
+
+local function convertForce(val, fromU, toU)
+  local n = val
+  if fromU == "Kilonewtons (kN)" then n = val * 1000
+  elseif fromU == "Gram-force (gf)" then n = val * 0.00980665
+  elseif fromU == "Kilogram-force (kgf)" then n = val * 9.80665
+  elseif fromU == "Pound-force (lbf)" then n = val * 4.44822 end
+
+  if toU == "Kilonewtons (kN)" then return n / 1000
+  elseif toU == "Gram-force (gf)" then return n / 0.00980665
+  elseif toU == "Kilogram-force (kgf)" then return n / 9.80665
+  elseif toU == "Pound-force (lbf)" then return n / 4.44822
+  else return n end
+end
+
+local function convertFrequency(val, fromU, toU)
+  local hz = val
+  if fromU == "Kilohertz (kHz)" then hz = val * 1000
+  elseif fromU == "Megahertz (MHz)" then hz = val * 1000000
+  elseif fromU == "Gigahertz (GHz)" then hz = val * 1000000000 end
+
+  if toU == "Kilohertz (kHz)" then return hz / 1000
+  elseif toU == "Megahertz (MHz)" then return hz / 1000000
+  elseif toU == "Gigahertz (GHz)" then return hz / 1000000000
+  else return hz end
+end
+
+local function convertDataRate(val, fromU, toU)
+  local bps = val
+  if fromU == "Kilobits/sec (Kbps)" then bps = val * 1000
+  elseif fromU == "Megabits/sec (Mbps)" then bps = val * 1000000
+  elseif fromU == "Gigabits/sec (Gbps)" then bps = val * 1000000000 end
+
+  if toU == "Kilobits/sec (Kbps)" then return bps / 1000
+  elseif toU == "Megabits/sec (Mbps)" then return bps / 1000000
+  elseif toU == "Gigabits/sec (Gbps)" then return bps / 1000000000
+  else return bps end
+end
+
+local function convertFuel(val, fromU, toU)
+  local kml = val
+  if fromU == "Miles/Gallon (US)" then kml = val * 0.425144
+  elseif fromU == "Miles/Gallon (UK)" then kml = val * 0.354006 end
+
+  if toU == "Miles/Gallon (US)" then return kml / 0.425144
+  elseif toU == "Miles/Gallon (UK)" then return kml / 0.354006
+  else return kml end
+end
+
+-- ==========================================
+-- SMART CONVERTER UI BUILDER 
+-- ==========================================
+local function openSmartConverterDialog(title, unitList, modeType)
+  speakText(title .. " opened.")
   
-  if currentMode == "Basic" then
-    local expression = currentInput:gsub("%%", "/100")
-    expression = expression:gsub("sin", "math.sin")
-    expression = expression:gsub("cos", "math.cos")
-    expression = expression:gsub("tan", "math.tan")
-    expression = expression:gsub("sqrt", "math.sqrt")
-    expression = expression:gsub("log", "math.log10")
+  local layout = LinearLayout(activity)
+  layout.setOrientation(LinearLayout.VERTICAL)
+  layout.setPadding(30, 30, 30, 30)
 
-    local compiledFunc, loadErr = load("return " .. expression)
-    if compiledFunc then
-      local successFlag, calculationResult = pcall(compiledFunc)
-      if successFlag and calculationResult then
-        local finalStr = tostring(calculationResult)
-        displayResultDialog(finalStr)
-        currentInput = finalStr
-      else
-        displayResultDialog("Error")
+  local inputContainer = LinearLayout(activity)
+  inputContainer.setOrientation(LinearLayout.HORIZONTAL)
+  inputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+  
+  local inputEdit = EditText(activity)
+  inputEdit.setHint("Enter Value")
+  inputEdit.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL)
+  local inputParams = LinearLayout.LayoutParams(0, -2)
+  inputParams.weight = 1
+  inputEdit.setLayoutParams(inputParams)
+  inputContainer.addView(inputEdit)
+  
+  local inputClearBtn = Button(activity)
+  inputClearBtn.setText("X")
+  inputClearBtn.setContentDescription("Clear Input")
+  inputClearBtn.setTextColor(0xFFFFFFFF)
+  inputClearBtn.setBackgroundColor(0xFFFF3B30) 
+  local clearParams1 = LinearLayout.LayoutParams(-2, -2)
+  clearParams1.setMargins(10, 0, 10, 0)
+  inputClearBtn.setLayoutParams(clearParams1)
+  inputContainer.addView(inputClearBtn)
+
+  layout.addView(inputContainer)
+
+  local spinnerFrom = Spinner(activity)
+  local adapterFrom = ArrayAdapter(activity, android.R.layout.simple_spinner_item, unitList)
+  adapterFrom.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+  spinnerFrom.setAdapter(adapterFrom)
+  layout.addView(spinnerFrom)
+
+  local space1 = TextView(activity)
+  space1.setText("\n")
+  space1.setTextSize(6)
+  layout.addView(space1)
+
+  local outputContainer = LinearLayout(activity)
+  outputContainer.setOrientation(LinearLayout.HORIZONTAL)
+  outputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+  
+  local outputEdit = EditText(activity)
+  outputEdit.setHint("Result")
+  outputEdit.setFocusable(false) 
+  outputEdit.setCursorVisible(false)
+  outputEdit.setTextColor(0xFF03DAC6)
+  local outputParams = LinearLayout.LayoutParams(0, -2)
+  outputParams.weight = 1
+  outputEdit.setLayoutParams(outputParams)
+  outputContainer.addView(outputEdit)
+
+  local outputClearBtn = Button(activity)
+  outputClearBtn.setText("X")
+  outputClearBtn.setContentDescription("Clear Output")
+  outputClearBtn.setTextColor(0xFFFFFFFF)
+  outputClearBtn.setBackgroundColor(0xFFFF3B30) 
+  local clearParams2 = LinearLayout.LayoutParams(-2, -2)
+  clearParams2.setMargins(10, 0, 10, 0)
+  outputClearBtn.setLayoutParams(clearParams2)
+  outputContainer.addView(outputClearBtn)
+  
+  layout.addView(outputContainer)
+
+  local spinnerTo = Spinner(activity)
+  local adapterTo = ArrayAdapter(activity, android.R.layout.simple_spinner_item, unitList)
+  adapterTo.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+  spinnerTo.setAdapter(adapterTo)
+  layout.addView(spinnerTo)
+
+  inputClearBtn.setOnClickListener(View.OnClickListener{
+    onClick = function()
+      inputEdit.setText("")
+      outputEdit.setText("")
+      speakText("Input Cleared")
+    end
+  })
+
+  outputClearBtn.setOnClickListener(View.OnClickListener{
+    onClick = function()
+      outputEdit.setText("")
+      speakText("Output Cleared")
+    end
+  })
+
+  spinnerFrom.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
+    onItemSelected = function(parent, view, position, id)
+      local selectedUnit = unitList[position + 1]
+      inputEdit.setHint("Enter " .. selectedUnit)
+    end
+  })
+
+  spinnerTo.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
+    onItemSelected = function(parent, view, position, id)
+      local selectedUnit = unitList[position + 1]
+      outputEdit.setHint("Result in " .. selectedUnit)
+    end
+  })
+
+  local dlg = LuaDialog(activity)
+  dlg.setTitle(title)
+  dlg.setView(layout)
+
+  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
+  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
+  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil) 
+  
+  dlg.show()
+
+  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local valStr = inputEdit.getText().toString()
+      local numVal = tonumber(valStr)
+      if not numVal then
+        outputEdit.setText("")
+        speakText("Please enter a valid number in the first box!")
+        return
       end
-    else
-      displayResultDialog("Invalid Expression")
+
+      local uFrom = tostring(spinnerFrom.getSelectedItem())
+      local uTo = tostring(spinnerTo.getSelectedItem())
+      local output = 0
+
+      if modeType == "Length" then output = convertLength(numVal, uFrom, uTo)
+      elseif modeType == "Weight" then output = convertWeight(numVal, uFrom, uTo)
+      elseif modeType == "Temp" then output = convertTemp(numVal, uFrom, uTo)
+      elseif modeType == "Area" then output = convertArea(numVal, uFrom, uTo)
+      elseif modeType == "Data" then output = convertData(numVal, uFrom, uTo)
+      elseif modeType == "Speed" then output = convertSpeed(numVal, uFrom, uTo)
+      elseif modeType == "Time" then output = convertTime(numVal, uFrom, uTo)
+      elseif modeType == "Volume" then output = convertVolume(numVal, uFrom, uTo)
+      elseif modeType == "Power" then output = convertPower(numVal, uFrom, uTo)
+      elseif modeType == "Pressure" then output = convertPressure(numVal, uFrom, uTo)
+      elseif modeType == "Energy" then output = convertEnergy(numVal, uFrom, uTo)
+      elseif modeType == "Angle" then output = convertAngle(numVal, uFrom, uTo)
+      elseif modeType == "Force" then output = convertForce(numVal, uFrom, uTo)
+      elseif modeType == "Frequency" then output = convertFrequency(numVal, uFrom, uTo)
+      elseif modeType == "DataRate" then output = convertDataRate(numVal, uFrom, uTo)
+      elseif modeType == "Fuel" then output = convertFuel(numVal, uFrom, uTo)
+      end
+
+      local formattedOutput = string.format("%.8f", output)
+      if formattedOutput:find("%.") then
+        formattedOutput = formattedOutput:gsub("0+$", ""):gsub("%.$", "")
+      end
+
+      local outputStr = formattedOutput .. " " .. uTo
+      outputEdit.setText(outputStr)
+      
+      local finalString = valStr .. " " .. uFrom .. " is equal to " .. outputStr
+      table.insert(historyLog, valStr .. " " .. uFrom .. " = " .. outputStr)
+      speakText(finalString)
     end
-    
-  elseif currentMode == "Length" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertLength(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-    
-  elseif currentMode == "Weight" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertWeight(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-    
-  elseif currentMode == "Temp" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertTemp(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.2f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
+  })
 
-  elseif currentMode == "Area" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertArea(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-
-  elseif currentMode == "Data" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertData(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-
-  elseif currentMode == "Speed" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertSpeed(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-
-  elseif currentMode == "Time" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertTime(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-
-  elseif currentMode == "Volume" then
-    local numericVal = tonumber(currentInput)
-    if numericVal then
-      local outputVal = convertVolume(numericVal, unitFrom, unitTo)
-      local resString = string.format("%.4f", outputVal):gsub("%.0+$", "") .. " " .. unitTo
-      displayResultDialog(resString)
-      currentInput = tostring(outputVal)
-    else displayResultDialog("Enter valid number") end
-  end
+  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local currentRes = outputEdit.getText().toString()
+      if currentRes == "" then
+        copyToClipboard("")
+      else
+        copyToClipboard(currentRes)
+      end
+    end
+  })
 end
 
--- Smart Unit Selection Dialog
-local function openUnitSelection(availableUnits, titlePrefix)
-  local containerLayout = LinearLayout(activity)
-  containerLayout.setOrientation(LinearLayout.VERTICAL)
-  containerLayout.setPadding(35, 35, 35, 35)
 
-  local labelSource = TextView(activity)
-  labelSource.setText("From Unit:")
-  labelSource.setTextColor(0xFFFFFFFF)
-  containerLayout.addView(labelSource)
+-- ==========================================
+-- BASIC MATH CALCULATOR DIALOG 
+-- ==========================================
+local function openBasicCalculatorDialog()
+  speakText("Basic Math Calculator opened. Enter your math expression.")
+  
+  local layout = LinearLayout(activity)
+  layout.setOrientation(LinearLayout.VERTICAL)
+  layout.setPadding(30, 30, 30, 30)
 
-  local sourceSpinner = Spinner(activity)
-  local adapterSource = ArrayAdapter(activity, android.R.layout.simple_spinner_item, availableUnits)
-  adapterSource.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  sourceSpinner.setAdapter(adapterSource)
-  containerLayout.addView(sourceSpinner)
+  local inputContainer = LinearLayout(activity)
+  inputContainer.setOrientation(LinearLayout.HORIZONTAL)
+  inputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+  
+  local inputEdit = EditText(activity)
+  inputEdit.setHint("Enter Expression (e.g., 45+20*5)")
+  inputEdit.setInputType(InputType.TYPE_CLASS_TEXT) 
+  local inputParams = LinearLayout.LayoutParams(0, -2)
+  inputParams.weight = 1
+  inputEdit.setLayoutParams(inputParams)
+  inputContainer.addView(inputEdit)
+  
+  local inputClearBtn = Button(activity)
+  inputClearBtn.setText("X")
+  inputClearBtn.setContentDescription("Clear Expression")
+  inputClearBtn.setTextColor(0xFFFFFFFF)
+  inputClearBtn.setBackgroundColor(0xFFFF3B30)
+  local clearParams1 = LinearLayout.LayoutParams(-2, -2)
+  clearParams1.setMargins(10, 0, 10, 0)
+  inputClearBtn.setLayoutParams(clearParams1)
+  inputContainer.addView(inputClearBtn)
 
-  local labelTarget = TextView(activity)
-  labelTarget.setText("\nTo Unit:")
-  labelTarget.setTextColor(0xFFFFFFFF)
-  containerLayout.addView(labelTarget)
+  layout.addView(inputContainer)
 
-  local targetSpinner = Spinner(activity)
-  local adapterTarget = ArrayAdapter(activity, android.R.layout.simple_spinner_item, availableUnits)
-  adapterTarget.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  targetSpinner.setAdapter(adapterTarget)
-  containerLayout.addView(targetSpinner)
+  local space1 = TextView(activity)
+  space1.setText("\n")
+  space1.setTextSize(6)
+  layout.addView(space1)
 
-  local unitDlg = LuaDialog(activity)
-  unitDlg.setView(containerLayout)
-  unitDlg.setTitle(titlePrefix .. " Converter")
+  local outputContainer = LinearLayout(activity)
+  outputContainer.setOrientation(LinearLayout.HORIZONTAL)
+  outputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+  
+  local outputEdit = EditText(activity)
+  outputEdit.setHint("Result")
+  outputEdit.setFocusable(false)
+  outputEdit.setCursorVisible(false)
+  outputEdit.setTextColor(0xFF03DAC6)
+  local outputParams = LinearLayout.LayoutParams(0, -2)
+  outputParams.weight = 1
+  outputEdit.setLayoutParams(outputParams)
+  outputContainer.addView(outputEdit)
 
-  unitDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Confirm", function()
-    unitFrom = tostring(sourceSpinner.getSelectedItem())
-    unitTo = tostring(targetSpinner.getSelectedItem())
-    speakText("Converted from " .. unitFrom .. " to " .. unitTo)
-    if modeIndicatorLabel then
-      modeIndicatorLabel.setText("MODE: " .. currentMode:upper() .. " (" .. unitFrom:sub(1,3) .. "->" .. unitTo:sub(1,3) .. ")")
+  local outputClearBtn = Button(activity)
+  outputClearBtn.setText("X")
+  outputClearBtn.setContentDescription("Clear Result")
+  outputClearBtn.setTextColor(0xFFFFFFFF)
+  outputClearBtn.setBackgroundColor(0xFFFF3B30)
+  local clearParams2 = LinearLayout.LayoutParams(-2, -2)
+  clearParams2.setMargins(10, 0, 10, 0)
+  outputClearBtn.setLayoutParams(clearParams2)
+  outputContainer.addView(outputClearBtn)
+  
+  layout.addView(outputContainer)
+
+  inputClearBtn.setOnClickListener(View.OnClickListener{
+    onClick = function()
+      inputEdit.setText("")
+      outputEdit.setText("")
+      speakText("Expression Cleared")
     end
-  end)
+  })
 
-  unitDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Cancel", nil)
-  unitDlg.show()
+  outputClearBtn.setOnClickListener(View.OnClickListener{
+    onClick = function()
+      outputEdit.setText("")
+      speakText("Result Cleared")
+    end
+  })
+
+  local dlg = LuaDialog(activity)
+  dlg.setTitle("Basic Math Calculator")
+  dlg.setView(layout)
+
+  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
+  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
+  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
+  
+  dlg.show()
+
+  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local expr = inputEdit.getText().toString()
+      if expr == "" then
+        outputEdit.setText("")
+        speakText("Please enter a math expression!")
+        return
+      end
+
+      local safeExpression = expr
+      if safeExpression:sub(-1):match("[%+%-%*/%%]") then
+        safeExpression = safeExpression:sub(1, -2)
+      end
+      local expressionToEval = safeExpression:gsub("%%", "/100")
+      
+      local compiledFunc, loadErr = load("return " .. expressionToEval)
+      if compiledFunc then
+        local successFlag, calculationResult = pcall(compiledFunc)
+        if successFlag and calculationResult then
+          local finalStr = tostring(calculationResult)
+          outputEdit.setText(finalStr)
+          table.insert(historyLog, expr .. " = " .. finalStr)
+          speakText(expr .. " is equal to " .. finalStr)
+        else
+          outputEdit.setText("Error")
+          speakText("Calculation Error")
+        end
+      else
+        outputEdit.setText("Invalid Expression")
+        speakText("Invalid Expression")
+      end
+    end
+  })
+
+  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local currentRes = outputEdit.getText().toString()
+      if currentRes == "" or currentRes == "Error" or currentRes == "Invalid Expression" then
+        copyToClipboard("")
+      else
+        copyToClipboard(currentRes)
+      end
+    end
+  })
 end
 
--- History Screen Viewer Dialog
+
+-- ==========================================
+-- NEW: AGE & DATE CALCULATOR (Live Date Engine)
+-- ==========================================
+local function openAgeCalculatorDialog()
+  speakText("Age and Date Calculator opened.")
+  
+  local layout = LinearLayout(activity)
+  layout.setOrientation(LinearLayout.VERTICAL)
+  layout.setPadding(30, 30, 30, 30)
+
+  -- Day Input
+  local lblD = TextView(activity)
+  lblD.setText("1. Enter Birth Day (1 to 31):")
+  lblD.setTextColor(0xFF03DAC6)
+  layout.addView(lblD)
+  
+  local editD = EditText(activity)
+  editD.setHint("e.g. 15")
+  editD.setInputType(InputType.TYPE_CLASS_NUMBER)
+  layout.addView(editD)
+
+  -- Month Input
+  local lblM = TextView(activity)
+  lblM.setText("\n2. Enter Birth Month (1 to 12):")
+  lblM.setTextColor(0xFF03DAC6)
+  layout.addView(lblM)
+  
+  local editM = EditText(activity)
+  editM.setHint("e.g. 8")
+  editM.setInputType(InputType.TYPE_CLASS_NUMBER)
+  layout.addView(editM)
+
+  -- Year Input
+  local lblY = TextView(activity)
+  lblY.setText("\n3. Enter Birth Year:")
+  lblY.setTextColor(0xFF03DAC6)
+  layout.addView(lblY)
+  
+  local editY = EditText(activity)
+  editY.setHint("e.g. 1995")
+  editY.setInputType(InputType.TYPE_CLASS_NUMBER)
+  layout.addView(editY)
+
+  -- Clear All Button
+  local clearBtn = Button(activity)
+  clearBtn.setText("Clear All Fields")
+  clearBtn.setTextColor(0xFFFFFFFF)
+  clearBtn.setBackgroundColor(0xFFFF3B30)
+  local btnParams = LinearLayout.LayoutParams(-1, -2)
+  btnParams.setMargins(0, 15, 0, 15)
+  clearBtn.setLayoutParams(btnParams)
+  layout.addView(clearBtn)
+
+  -- Result Output
+  local lblRes = TextView(activity)
+  lblRes.setText("Result:")
+  lblRes.setTextColor(0xFF03DAC6)
+  layout.addView(lblRes)
+
+  local outputEdit = EditText(activity)
+  outputEdit.setHint("Your exact age will appear here")
+  outputEdit.setFocusable(false)
+  outputEdit.setCursorVisible(false)
+  outputEdit.setTextColor(0xFFFFFFFF)
+  layout.addView(outputEdit)
+
+  clearBtn.setOnClickListener(View.OnClickListener{
+    onClick = function()
+      editD.setText("")
+      editM.setText("")
+      editY.setText("")
+      outputEdit.setText("")
+      speakText("All fields cleared")
+    end
+  })
+
+  local dlg = LuaDialog(activity)
+  dlg.setTitle("Age & Date Calculator")
+  dlg.setView(layout)
+
+  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
+  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
+  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
+  
+  dlg.show()
+
+  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local d1 = tonumber(editD.getText().toString())
+      local m1 = tonumber(editM.getText().toString())
+      local y1 = tonumber(editY.getText().toString())
+
+      if not d1 or not m1 or not y1 or d1 < 1 or d1 > 31 or m1 < 1 or m1 > 12 or y1 < 1900 then
+        outputEdit.setText("")
+        speakText("Please enter a valid Date of Birth!")
+        return
+      end
+
+      -- USING NATIVE ANDROID SYSTEM CALENDAR FOR 100% ACCURATE LIVE TIME
+      local cal = Calendar.getInstance()
+      local y2 = cal.get(Calendar.YEAR)
+      local m2 = cal.get(Calendar.MONTH) + 1 -- Java Calendar months are 0-based
+      local d2 = cal.get(Calendar.DAY_OF_MONTH)
+
+      local resY = y2 - y1
+      local resM = m2 - m1
+      local resD = d2 - d1
+
+      if resD < 0 then
+          resM = resM - 1
+          local prevMonth = m2 - 1
+          if prevMonth == 0 then prevMonth = 12 end
+          local daysInPrevMonth = 31
+          if prevMonth == 4 or prevMonth == 6 or prevMonth == 9 or prevMonth == 11 then 
+              daysInPrevMonth = 30
+          elseif prevMonth == 2 then
+            if (y2 % 4 == 0 and y2 % 100 ~= 0) or (y2 % 400 == 0) then daysInPrevMonth = 29 else daysInPrevMonth = 28 end
+          end
+          resD = resD + daysInPrevMonth
+      end
+      
+      if resM < 0 then
+          resY = resY - 1
+          resM = resM + 12
+      end
+
+      if resY < 0 then
+         outputEdit.setText("")
+         speakText("Birth year cannot be in the future!")
+         return
+      end
+
+      local resultStr = resY .. " Years, " .. resM .. " Months, " .. resD .. " Days"
+      outputEdit.setText(resultStr)
+      table.insert(historyLog, "DOB: " .. d1 .. "/" .. m1 .. "/" .. y1 .. " = Age: " .. resultStr)
+      speakText("Your exact age is " .. resultStr)
+    end
+  })
+
+  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local currentRes = outputEdit.getText().toString()
+      if currentRes == "" then
+        copyToClipboard("")
+      else
+        copyToClipboard(currentRes)
+      end
+    end
+  })
+end
+
+
+-- ==========================================
+-- History and About Dialogs
+-- ==========================================
 local function showHistoryDialog()
   if #historyLog == 0 then
     speakText("History is empty")
@@ -516,330 +740,200 @@ local function showHistoryDialog()
   speakText("Showing calculation history")
   local historyLayout = LinearLayout(activity)
   historyLayout.setOrientation(LinearLayout.VERTICAL)
-  historyLayout.setPadding(25, 25, 25, 25)
-
+  
   local historyListView = ListView(activity)
   local historyAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, historyLog)
   historyListView.setAdapter(historyAdapter)
-  
-  local listParams = LinearLayout.LayoutParams(-1, 600)
-  historyListView.setLayoutParams(listParams)
   historyLayout.addView(historyListView)
 
   local histDlg = LuaDialog(activity)
   histDlg.setView(historyLayout)
   histDlg.setTitle("Calculation History")
   
-  histDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Clear History", function()
-    historyLog = {}
-    speakText("All history cleared")
-  end)
-
-  histDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", function()
-    speakText("Closed history")
-  end)
+  histDlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Share", function() end)
+  histDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Clear", function() end)
+  histDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
   
   histDlg.show()
-end
 
--- Settings Dialog Viewer with TTS Engine Picker
-local function showSettingsDialog()
-  speakText("Settings opened")
-  local settingsLayout = LinearLayout(activity)
-  settingsLayout.setOrientation(LinearLayout.VERTICAL)
-  settingsLayout.setPadding(35, 35, 35, 35)
-
-  local lblEngine = TextView(activity)
-  lblEngine.setText("Select TTS Engine:")
-  lblEngine.setTextColor(0xFFFFFFFF)
-  settingsLayout.addView(lblEngine)
-
-  local engineSpinner = Spinner(activity)
-  local adapterEngine = ArrayAdapter(activity, android.R.layout.simple_spinner_item, installedTtsEngineNames)
-  adapterEngine.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  engineSpinner.setAdapter(adapterEngine)
-
-  local currentEngineIndex = 0
-  for idx, pkg in ipairs(installedTtsEngines) do
-    if pkg == selectedTtsEnginePackage then
-      currentEngineIndex = idx - 1
-      break
+  histDlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      local historyText = table.concat(historyLog, "\n")
+      local shareIntent = Intent(Intent.ACTION_SEND)
+      shareIntent.setType("text/plain")
+      shareIntent.putExtra(Intent.EXTRA_TEXT, "Calculation History:\n\n" .. historyText .. "\n\n(Generated by Calculator Pro - By Hafiz Zeeshan)")
+      activity.startActivity(Intent.createChooser(shareIntent, "Share History Via"))
     end
-  end
-  engineSpinner.setSelection(currentEngineIndex)
-  settingsLayout.addView(engineSpinner)
+  })
 
-  local lblSpace1 = TextView(activity)
-  lblSpace1.setText("\n")
-  settingsLayout.addView(lblSpace1)
-
-  local lblSpeech = TextView(activity)
-  lblSpeech.setText("Speech Rate (Speed: " .. string.format("%.1f", settingSpeechRate) .. "x)")
-  lblSpeech.setTextColor(0xFFFFFFFF)
-  settingsLayout.addView(lblSpeech)
-
-  local speedSpinner = Spinner(activity)
-  local speedOptions = {"0.5x (Slow)", "1.0x (Normal)", "1.5x (Fast)", "2.0x (Very Fast)"}
-  local adapterSpeed = ArrayAdapter(activity, android.R.layout.simple_spinner_item, speedOptions)
-  adapterSpeed.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  speedSpinner.setAdapter(adapterSpeed)
-  
-  if settingSpeechRate == 0.5 then speedSpinner.setSelection(0)
-  elseif settingSpeechRate == 1.0 then speedSpinner.setSelection(1)
-  elseif settingSpeechRate == 1.5 then speedSpinner.setSelection(2)
-  elseif settingSpeechRate == 2.0 then speedSpinner.setSelection(3)
-  end
-  settingsLayout.addView(speedSpinner)
-
-  local lblSpace2 = TextView(activity)
-  lblSpace2.setText("\n")
-  settingsLayout.addView(lblSpace2)
-
-  local vibrationCheck = CheckBox(activity)
-  vibrationCheck.setText("Enable Vibration Feedback")
-  vibrationCheck.setTextColor(0xFFFFFFFF)
-  vibrationCheck.setChecked(settingVibrationEnabled)
-  settingsLayout.addView(vibrationCheck)
-
-  local settDlg = LuaDialog(activity)
-  settDlg.setView(settingsLayout)
-  settDlg.setTitle("Calculator Settings")
-
-  settDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Save", function()
-    local selectedEnginePos = engineSpinner.getSelectedItemPosition() + 1
-    selectedTtsEnginePackage = installedTtsEngines[selectedEnginePos] or ""
-    initTtsWithEngine(selectedTtsEnginePackage)
-
-    local selectedSpeedStr = tostring(speedSpinner.getSelectedItem())
-    if selectedSpeedStr:find("0.5") then settingSpeechRate = 0.5
-    elseif selectedSpeedStr:find("1.0") then settingSpeechRate = 1.0
-    elseif selectedSpeedStr:find("1.5") then settingSpeechRate = 1.5
-    elseif selectedSpeedStr:find("2.0") then settingSpeechRate = 2.0
-    end
-    
-    settingVibrationEnabled = vibrationCheck.isChecked()
-    task(300, function()
-      speakText("Settings saved successfully")
-    end)
-  end)
-
-  settDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Cancel", nil)
-  settDlg.show()
-end
-
--- About Dialog Viewer
-local function showAboutDialog()
-  local aboutMessage = "Talking Calculator\n\nDesigned specially for Blind Users.\n\nCreated by Hafiz Zeeshan"
-  speakText("About Talking Calculator. Designed specially for Blind Users. Created by Hafiz Zeeshan.")
-  
-  local abtDlg = LuaDialog(activity)
-  abtDlg.setTitle("About Calculator")
-  abtDlg.setMessage(aboutMessage)
-  
-  abtDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Send Feedback", function()
-    pcall(function()
-      local defaultFeedbackMsg = "Hello Hafiz Zeeshan! I am using your Talking Calculator. I want to give feedback regarding this project."
-      local encodedMsg = Uri.encode(defaultFeedbackMsg)
-      local whatsappUri = Uri.parse("https://api.whatsapp.com/send?phone=" .. whatsappNumber .. "&text=" .. encodedMsg)
-      local intent = Intent(Intent.ACTION_VIEW, whatsappUri)
-      activity.startActivity(intent)
-    end)
-  end)
-
-  abtDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Close", nil)
-  abtDlg.show()
-end
-
--- Menu Options Dialog
-local function showMenuOptions()
-  local optionsList = {
-    "Basic Calculator Mode",
-    "Financial Interest Calculator",
-    "BMI Health Calculator",
-    "Percentage Calculator",
-    "Length Converter",
-    "Weight Converter",
-    "Temperature Converter",
-    "Area Converter",
-    "Data Storage Converter",
-    "Speed Converter",
-    "Time Converter",
-    "Volume Converter",
-    "View History Log",
-    "Settings",
-    "About"
-  }
-  
-  local optionsListWidget = ListView(activity)
-  local listAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, optionsList)
-  optionsListWidget.setAdapter(listAdapter)
-  
-  local menuDlg = LuaDialog(activity)
-  menuDlg.setView(optionsListWidget)
-  menuDlg.setTitle("More Options & Calculation Modes")
-  menuDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Close", nil)
-  menuDlg.show()
-
-  optionsListWidget.setOnItemClickListener(AdapterView.OnItemClickListener{
-    onItemClick = function(parent, view, position, id)
-      menuDlg.dismiss()
-      task(150, function()
-        local chosenOption = optionsList[position + 1]
-        if chosenOption == "Basic Calculator Mode" then
-          currentMode = "Basic"
-          speakText("Basic Calculator Mode")
-          if modeIndicatorLabel then modeIndicatorLabel.setText("MODE: BASIC") end
-        elseif chosenOption == "Financial Interest Calculator" then
-          openFinancialCalcDialog()
-        elseif chosenOption == "BMI Health Calculator" then
-          openBmiCalcDialog()
-        elseif chosenOption == "Percentage Calculator" then
-          openPercentageCalcDialog()
-        elseif chosenOption == "Length Converter" then
-          currentMode = "Length"
-          speakText("Length Converter. Select units.")
-          openUnitSelection({"Meters", "Kilometers", "Centimeters", "Millimeters", "Inches", "Feet", "Yards"}, "Length")
-        elseif chosenOption == "Weight Converter" then
-          currentMode = "Weight"
-          speakText("Weight Converter. Select units.")
-          openUnitSelection({"Kilograms", "Grams", "Milligrams", "Pounds", "Ounces"}, "Weight")
-        elseif chosenOption == "Temperature Converter" then
-          currentMode = "Temp"
-          speakText("Temperature Converter. Select units.")
-          openUnitSelection({"Celsius", "Fahrenheit", "Kelvin"}, "Temperature")
-        elseif chosenOption == "Area Converter" then
-          currentMode = "Area"
-          speakText("Area Converter. Select units.")
-          openUnitSelection({"Square Meters", "Square Kilometers", "Square Feet", "Square Inches", "Acres"}, "Area")
-        elseif chosenOption == "Data Storage Converter" then
-          currentMode = "Data"
-          speakText("Data Storage Converter. Select units.")
-          openUnitSelection({"Megabytes (MB)", "Kilobytes (KB)", "Gigabytes (GB)", "Terabytes (TB)", "Bytes"}, "Data")
-        elseif chosenOption == "Speed Converter" then
-          currentMode = "Speed"
-          speakText("Speed Converter. Select units.")
-          openUnitSelection({"Kilometers/Hour (km/h)", "Meters/Sec (m/s)", "Miles/Hour (mph)", "Knots"}, "Speed")
-        elseif chosenOption == "Time Converter" then
-          currentMode = "Time"
-          speakText("Time Converter. Select units.")
-          openUnitSelection({"Seconds", "Minutes", "Hours", "Days"}, "Time")
-        elseif chosenOption == "Volume Converter" then
-          currentMode = "Volume"
-          speakText("Volume Converter. Select units.")
-          openUnitSelection({"Liters", "Milliliters", "US Gallons"}, "Volume")
-        elseif chosenOption == "View History Log" then
-          showHistoryDialog()
-        elseif chosenOption == "Settings" then
-          showSettingsDialog()
-        elseif chosenOption == "About" then
-          showAboutDialog()
-        end
-      end)
+  histDlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
+    onClick = function()
+      historyLog = {}
+      historyListView.setAdapter(ArrayAdapter(activity, android.R.layout.simple_list_item_1, historyLog))
+      speakText("History cleared")
     end
   })
 end
 
--- Programmatic Main Interface Builder
+local function showAboutDialog()
+  local msg = "Calculator Pro\n\nProject By: Hafiz Zeeshan\n\nDescription:\nCalculator Pro is an advanced, all-in-one calculator and smart converter toolkit. It is fully optimized for visually impaired users with native screen reader support.\n\nHow to Use:\nSelect any tool from the categorized list. Enter your value in the first box, and the result will automatically appear in the second box. Use the 'X' button to quickly clear fields, and 'Copy Result' to save your answers.\n\nThank you for using Calculator Pro!"
+  
+  speakText("About Calculator Pro. Project by Hafiz Zeeshan.")
+  
+  local abtDlg = LuaDialog(activity)
+  abtDlg.setTitle("About & Feedback")
+  abtDlg.setMessage(msg)
+  
+  abtDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Send Feedback", function()
+    pcall(function()
+      local defaultMsg = Uri.encode("Hello Hafiz Zeeshan! I am using Calculator Pro. I want to give feedback regarding this project.")
+      local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://api.whatsapp.com/send?phone=" .. whatsappNumber .. "&text=" .. defaultMsg))
+      activity.startActivity(intent)
+    end)
+  end)
+  abtDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
+  abtDlg.show()
+end
+
+
+-- ==========================================
+-- CATEGORY DATA STRUCTURE (FINAL VERIFIED)
+-- ==========================================
+local categoryNames = {
+  "All Tools (Show Everything)",
+  "Math & General Tools",
+  "Everyday Converters",
+  "Physics & Engineering",
+  "Tech & Computing"
+}
+
+local categoryData = {
+  ["All Tools (Show Everything)"] = {
+    "Basic Math Calculator", "Age & Date Calculator", 
+    "Length Converter", "Weight Converter", "Temperature Converter", 
+    "Area Converter", "Volume Converter", "Time Converter", "Speed Converter", "Fuel Economy Converter",
+    "Power Converter", "Pressure Converter", "Energy Converter", "Angle Converter", "Force Converter", "Frequency Converter", 
+    "Data Storage Converter", "Data Rate Converter",
+    "View History Log", "About & Feedback"
+  },
+  ["Math & General Tools"] = {
+    "Basic Math Calculator", "Age & Date Calculator", 
+    "View History Log", "About & Feedback"
+  },
+  ["Everyday Converters"] = {
+    "Length Converter", "Weight Converter", "Temperature Converter", 
+    "Area Converter", "Volume Converter", "Time Converter", "Speed Converter", "Fuel Economy Converter",
+    "View History Log", "About & Feedback"
+  },
+  ["Physics & Engineering"] = {
+    "Power Converter", "Pressure Converter", "Energy Converter", "Angle Converter", "Force Converter", "Frequency Converter",
+    "View History Log", "About & Feedback"
+  },
+  ["Tech & Computing"] = {
+    "Data Storage Converter", "Data Rate Converter",
+    "View History Log", "About & Feedback"
+  }
+}
+
+local currentList = categoryData["All Tools (Show Everything)"]
+
+-- ==========================================
+-- Clean Categorized Home Screen
+-- ==========================================
 local mainRootLayout = LinearLayout(activity)
 mainRootLayout.setOrientation(LinearLayout.VERTICAL)
 mainRootLayout.setLayoutParams(ViewGroup.LayoutParams(-1, -1))
 mainRootLayout.setBackgroundColor(0xFF121212)
 mainRootLayout.setPadding(25, 25, 25, 25)
 
--- Mode Label
-modeIndicatorLabel = TextView(activity)
-modeIndicatorLabel.setText("MODE: BASIC")
-modeIndicatorLabel.setTextColor(0xFFBB86FC)
-modeIndicatorLabel.setTextSize(16)
-modeIndicatorLabel.setGravity(Gravity.CENTER)
-mainRootLayout.addView(modeIndicatorLabel)
+local headerText = TextView(activity)
+headerText.setText("CALCULATOR PRO\nProject By Hafiz Zeeshan")
+headerText.setTextColor(0xFFBB86FC)
+headerText.setTextSize(18)
+headerText.setGravity(Gravity.CENTER)
+headerText.setPadding(0, 20, 0, 30)
+mainRootLayout.addView(headerText)
 
--- Screen Display Area
-screenDisplay = TextView(activity)
-screenDisplay.setText("0")
-screenDisplay.setTextColor(0xFFFFFFFF)
-screenDisplay.setTextSize(38)
-screenDisplay.setGravity(Gravity.RIGHT + Gravity.CENTER_VERTICAL)
-screenDisplay.setBackgroundColor(0xFF1E1E1E)
-local displaySizeParams = LinearLayout.LayoutParams(-1, 190)
-displaySizeParams.setMargins(0, 15, 0, 15)
-screenDisplay.setLayoutParams(displaySizeParams)
-screenDisplay.setPadding(20, 20, 20, 20)
-mainRootLayout.addView(screenDisplay)
+-- Category Spinner Layout
+local catLabel = TextView(activity)
+catLabel.setText("Select Category:")
+catLabel.setTextColor(0xFF03DAC6)
+catLabel.setTextSize(15)
+mainRootLayout.addView(catLabel)
 
--- Keypad Grid Layout
-keypadGrid = GridView(activity)
-keypadGrid.setNumColumns(4)
-local gridLayoutWeights = LinearLayout.LayoutParams(-1, 0)
-gridLayoutWeights.weight = 1
-keypadGrid.setLayoutParams(gridLayoutWeights)
-mainRootLayout.addView(keypadGrid)
+local categorySpinner = Spinner(activity)
+local catAdapter = ArrayAdapter(activity, android.R.layout.simple_spinner_item, categoryNames)
+catAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+categorySpinner.setAdapter(catAdapter)
+mainRootLayout.addView(categorySpinner)
 
--- Options Button Panel
-local optionsButton = Button(activity)
-optionsButton.setText("⋮ MORE OPTIONS & MODES")
-optionsButton.setTextColor(0xFF000000)
-optionsButton.setBackgroundColor(0xFF03DAC6)
-optionsButton.setLayoutParams(LinearLayout.LayoutParams(-1, 120))
-optionsButton.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    triggerVibration()
-    showMenuOptions()
+local space2 = TextView(activity)
+space2.setText("\n")
+space2.setTextSize(6)
+mainRootLayout.addView(space2)
+
+local toolsListView = ListView(activity)
+local layoutParams = LinearLayout.LayoutParams(-1, -1)
+toolsListView.setLayoutParams(layoutParams)
+mainRootLayout.addView(toolsListView)
+
+-- Function to Update List dynamically
+local function updateListView(category)
+  currentList = categoryData[category]
+  local listAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, currentList)
+  toolsListView.setAdapter(listAdapter)
+end
+
+-- Initialize first load
+updateListView("All Tools (Show Everything)")
+
+-- Spinner Selection Logic (Categories)
+local isInitialLoad = true
+categorySpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
+  onItemSelected = function(parent, view, position, id)
+    local selectedCat = categoryNames[position + 1]
+    updateListView(selectedCat)
+    if not isInitialLoad then
+      speakText(selectedCat .. " category selected. " .. tostring(#currentList) .. " tools loaded.")
+    end
+    isInitialLoad = false
   end
 })
-mainRootLayout.addView(optionsButton)
 
--- Set Root View to Activity Window
-activity.setContentView(mainRootLayout)
-
--- Keypad Button Array Mapping
-local buttonsCollection = {
-  "1", "2", "3", "+",
-  "4", "5", "6", "-",
-  "7", "8", "9", "*",
-  "0", ".", "/", "%",
-  "C", "⌫", "🔊", "="
-}
-
-local keypadAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, buttonsCollection)
-keypadGrid.setAdapter(keypadAdapter)
-
-keypadGrid.setOnItemClickListener(AdapterView.OnItemClickListener{
+-- List Click Logic (Tools)
+toolsListView.setOnItemClickListener(AdapterView.OnItemClickListener{
   onItemClick = function(parent, view, position, id)
     triggerVibration()
-    local pressedKey = buttonsCollection[position + 1]
-    speakText(pressedKey)
-    
-    if pressedKey == "C" then
-      currentInput = ""
-      screenDisplay.setText("0")
-    elseif pressedKey == "⌫" then
-      if #currentInput > 0 then
-        currentInput = currentInput:sub(1, -2)
-        screenDisplay.setText(currentInput == "" and "0" or currentInput)
+    task(100, function()
+      local opt = currentList[position + 1]
+      if opt == "Basic Math Calculator" then openBasicCalculatorDialog()
+      elseif opt == "Age & Date Calculator" then openAgeCalculatorDialog()
+      elseif opt == "Length Converter" then openSmartConverterDialog("Length Converter", {"Meters", "Kilometers", "Centimeters", "Millimeters", "Inches", "Feet", "Yards"}, "Length")
+      elseif opt == "Weight Converter" then openSmartConverterDialog("Weight Converter", {"Kilograms", "Grams", "Milligrams", "Pounds", "Ounces"}, "Weight")
+      elseif opt == "Temperature Converter" then openSmartConverterDialog("Temperature Converter", {"Celsius", "Fahrenheit", "Kelvin"}, "Temp")
+      elseif opt == "Area Converter" then openSmartConverterDialog("Area Converter", {"Square Meters", "Square Kilometers", "Square Feet", "Square Inches", "Acres"}, "Area")
+      elseif opt == "Volume Converter" then openSmartConverterDialog("Volume Converter", {"Liters", "Milliliters", "US Gallons"}, "Volume")
+      elseif opt == "Time Converter" then openSmartConverterDialog("Time Converter", {"Seconds", "Minutes", "Hours", "Days"}, "Time")
+      elseif opt == "Data Storage Converter" then openSmartConverterDialog("Data Storage Converter", {"Megabytes (MB)", "Kilobytes (KB)", "Gigabytes (GB)", "Terabytes (TB)", "Bytes"}, "Data")
+      elseif opt == "Speed Converter" then openSmartConverterDialog("Speed Converter", {"Kilometers/Hour (km/h)", "Meters/Sec (m/s)", "Miles/Hour (mph)", "Knots"}, "Speed")
+      elseif opt == "Power Converter" then openSmartConverterDialog("Power Converter", {"Watts (W)", "Kilowatts (kW)", "Horsepower (hp)"}, "Power")
+      elseif opt == "Pressure Converter" then openSmartConverterDialog("Pressure Converter", {"Pascal (Pa)", "Bar", "PSI", "Atmosphere (atm)"}, "Pressure")
+      elseif opt == "Energy Converter" then openSmartConverterDialog("Energy Converter", {"Joules (J)", "Calories (cal)", "Kilocalories (kcal)", "Kilowatt-hours (kWh)"}, "Energy")
+      elseif opt == "Angle Converter" then openSmartConverterDialog("Angle Converter", {"Degrees", "Radians", "Gradians"}, "Angle")
+      elseif opt == "Force Converter" then openSmartConverterDialog("Force Converter", {"Newtons (N)", "Kilonewtons (kN)", "Gram-force (gf)", "Kilogram-force (kgf)", "Pound-force (lbf)"}, "Force")
+      elseif opt == "Frequency Converter" then openSmartConverterDialog("Frequency Converter", {"Hertz (Hz)", "Kilohertz (kHz)", "Megahertz (MHz)", "Gigahertz (GHz)"}, "Frequency")
+      elseif opt == "Data Rate Converter" then openSmartConverterDialog("Data Rate Converter", {"Bits/sec (bps)", "Kilobits/sec (Kbps)", "Megabits/sec (Mbps)", "Gigabits/sec (Gbps)"}, "DataRate")
+      elseif opt == "Fuel Economy Converter" then openSmartConverterDialog("Fuel Economy Converter", {"Kilometers/Liter (km/L)", "Miles/Gallon (US)", "Miles/Gallon (UK)"}, "Fuel")
+      elseif opt == "View History Log" then showHistoryDialog()
+      elseif opt == "About & Feedback" then showAboutDialog()
       end
-    elseif pressedKey == "=" then
-      processCalculation()
-    elseif pressedKey == "🔊" then
-      speakText(tostring(screenDisplay.getText()))
-    else
-      if tostring(screenDisplay.getText()) == "0" and pressedKey ~= "." then
-        currentInput = pressedKey
-      else
-        currentInput = currentInput .. pressedKey
-      end
-      screenDisplay.setText(currentInput)
-    end
+    end)
   end
 })
 
--- Initial Welcome Dialog
-task(400, function()
-  local welcomeDlg = LuaDialog(activity)
-  welcomeDlg.setTitle("Talking Calculator")
-  welcomeDlg.setMessage("Welcome! Multi-mode Talking Calculator with TTS, History, Financial, BMI, and extended converters.\n\nCreated by Hafiz Zeeshan")
-  welcomeDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Start Calculator", function()
-    speakText("Calculator Started")
-  end)
-  welcomeDlg.show()
+activity.setContentView(mainRootLayout)
+
+-- App Startup
+task(500, function()
+  speakText("Calculator Pro Started. Project By Hafiz Zeeshan. Use the category dropdown to filter tools.")
 end)
