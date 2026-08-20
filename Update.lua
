@@ -1,939 +1,3341 @@
+-- main.lua : Advance Offline Music Player - BF Tech Welfare
+-- Mukammal Single-File Version (Search fix + Settings misclick fix + Echo/Bass sound)
+
 require "import"
 import "android.widget.*"
-import "android.view.*"
-import "android.graphics.*"
-import "android.content.Context"
+import "com.androlua.*"
+import "android.media.MediaPlayer"
+import "android.provider.MediaStore"
+import "android.media.audiofx.Equalizer"
+import "android.media.audiofx.PresetReverb"
+import "android.media.audiofx.BassBoost"
+import "android.view.SurfaceView"
+import "android.app.NotificationManager"
+import "android.app.NotificationChannel"
+import "android.app.Notification"
+import "android.os.Build"
 import "android.content.Intent"
 import "android.net.Uri"
-import "android.content.DialogInterface"
-import "android.view.accessibility.AccessibilityEvent"
-import "android.view.WindowManager"
-import "android.text.InputType"
-import "android.content.ClipboardManager"
-import "android.content.ClipData"
-import "java.util.Calendar"
-import "com.androlua.*"
 
--- Global State Management
-local historyLog = {}
+-- ================= STATE & CORE LOGIC =================
+MP = MP or {}
 
--- Support Info
-local whatsappNumber = "+923006151134"
-
--- Window Screen Settings
-activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
--- Vibration Utility (Always Enabled for Accessibility)
-local vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE)
-local function triggerVibration()
-  pcall(function() vibrator.vibrate(40) end)
+-- ===== Main-Thread Safe Helpers =====
+-- Pehle yahan asal background Thread use hota tha, lekin kuch devices (jaise Samsung Galaxy
+-- A-series) par Jieshuo ka Lua engine ek alag OS thread se wapas Lua code call karne par
+-- crash ho raha tha — ye is crash ki sabse mumkin wajah thi. Ab sab kaam wapas Jieshuo ke
+-- apne (main) thread par hi hota hai, taake crash na ho — bas surakshit tareeqe se, pcall
+-- ke sath, taake koi bhi ghalti Jieshuo ko crash na kar sake, sirf chup-chaap fail ho jaye.
+function runOnUiThread(fn)
+    pcall(fn)
 end
 
--- Universal Screen Reader Native Announcer
-local function speakText(txt)
-  local speechStr = tostring(txt)
-  speechStr = speechStr:gsub("%+", " plus ")
-  speechStr = speechStr:gsub("%-", " minus ")
-  speechStr = speechStr:gsub("%*", " multiplied by ")
-  speechStr = speechStr:gsub("/", " divided by ")
-  speechStr = speechStr:gsub("=", " equals ")
-  speechStr = speechStr:gsub("%%", " percent ")
-  speechStr = speechStr:gsub("%.", " point ")
-  speechStr = speechStr:gsub("C", " clear ")
-  speechStr = speechStr:gsub("⌫", " backspace ")
-  
-  pcall(function()
-    activity.getWindow().getDecorView().announceForAccessibility(speechStr)
-  end)
+function runInBackground(fn)
+    pcall(fn)
 end
 
--- Clipboard Copy Helper
-local function copyToClipboard(textToCopy)
-  if textToCopy and textToCopy ~= "" and textToCopy ~= "\n" then
-    local clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
-    local clip = ClipData.newPlainText("Calculator Result", textToCopy)
-    clipboard.setPrimaryClip(clip)
-    speakText("Result copied to clipboard")
-  else
-    speakText("Nothing to copy yet")
-  end
-end
+MP.songs = {}
+MP.allSongs = {}
+MP.currentIndex = 0
+MP.isPlaying = false
+MP.player = nil
+MP.equalizer = nil
+MP.presetReverb = nil
+MP.bassBoost = nil
+MP.repeatMode = "off"
+MP.shuffle = false
+MP.volume = 1.0
+MP.speed = 1.0
+MP.skipMs = 10000
+MP.eqPresetIndex = -1
+MP.echoPreset = -1
+MP.bassBoostOn = false
+MP.sleepTimerToken = 0
+MP.playlists = {}
+MP.favorites = {}
+MP.recentlyPlayed = {}
+MP.recentMax = 30
+MP.lyricsLines = {}
+MP.lyricsSongPath = nil
+MP.crossfadeOn = false
+MP.crossfadeSec = 5
+MP.isCrossfading = false
+MP.abPointA = nil
+MP.abPointB = nil
+MP.abRepeatOn = false
+MP.theme = "light"
+MP.voicePitch = 1.0
+MP.voiceSpeedDegree = 1.0
+MP.pitchIndex = 1
+MP.speedDegreeIndex = 1
+MP.speechDuckingEnabled = true
+MP.duckToken = 0
+MP.settingsPath = luajava.luadir .. "/settings.txt"
+MP.playlistsPath = luajava.luadir .. "/playlists.txt"
+MP.favoritesPath = luajava.luadir .. "/favorites.txt"
+MP.recentPath = luajava.luadir .. "/recent.txt"
+MP.backupPath = luajava.luadir .. "/backup.txt"
 
--- ==========================================
--- Core Conversion Logics 
--- ==========================================
-local function convertLength(val, fromU, toU)
-  local meters = val
-  if fromU == "Kilometers" then meters = val * 1000
-  elseif fromU == "Centimeters" then meters = val / 100
-  elseif fromU == "Millimeters" then meters = val / 1000
-  elseif fromU == "Inches" then meters = val * 0.0254
-  elseif fromU == "Feet" then meters = val * 0.3048
-  elseif fromU == "Yards" then meters = val * 0.9144 end
+-- ================= VIDEO PLAYER STATE (alag, MP se independent) =================
+VP = VP or {}
+VP.allVideos = {}
+VP.videos = {}
+VP.currentIndex = 0
+VP.isPlaying = false
+VP.repeatMode = "off"
+VP.skipMs = 10000
+VP.speed = 1.0
+VP.favorites = {}
+VP.recentlyPlayed = {}
+VP.recentMax = 30
+VP.playlists = {}
+VP.resumePositions = {}
+VP.subtitleLines = {}
+VP.subtitleVideoPath = nil
+VP.abPointA = nil
+VP.abPointB = nil
+VP.abRepeatOn = false
+VP.currentPlayerRef = nil
+VP.settingsPath = luajava.luadir .. "/video_settings.txt"
+VP.favoritesPath = luajava.luadir .. "/video_favorites.txt"
+VP.recentPath = luajava.luadir .. "/video_recent.txt"
+VP.playlistsPath = luajava.luadir .. "/video_playlists.txt"
+VP.resumePath = luajava.luadir .. "/video_resume.txt"
 
-  if toU == "Kilometers" then return meters / 1000
-  elseif toU == "Centimeters" then return meters * 100
-  elseif toU == "Millimeters" then return meters * 1000
-  elseif toU == "Inches" then return meters / 0.0254
-  elseif toU == "Feet" then return meters / 0.3048
-  elseif toU == "Yards" then return meters / 0.9144
-  else return meters end
-end
-
-local function convertWeight(val, fromU, toU)
-  local kg = val
-  if fromU == "Grams" then kg = val / 1000
-  elseif fromU == "Milligrams" then kg = val / 1000000
-  elseif fromU == "Pounds" then kg = val / 2.20462
-  elseif fromU == "Ounces" then kg = val / 35.274 end
-
-  if toU == "Grams" then return kg * 1000
-  elseif toU == "Milligrams" then return kg * 1000000
-  elseif toU == "Pounds" then return kg * 2.20462
-  elseif toU == "Ounces" then return kg * 35.274
-  else return kg end
-end
-
-local function convertTemp(val, fromU, toU)
-  if fromU == toU then return val end
-  local celsius = val
-  if fromU == "Fahrenheit" then celsius = (val - 32) * 5/9
-  elseif fromU == "Kelvin" then celsius = val - 273.15 end
-
-  if toU == "Fahrenheit" then return (celsius * 9/5) + 32
-  elseif toU == "Kelvin" then return celsius + 273.15
-  else return celsius end
-end
-
-local function convertArea(val, fromU, toU)
-  local sqMeters = val
-  if fromU == "Square Kilometers" then sqMeters = val * 1000000
-  elseif fromU == "Square Feet" then sqMeters = val * 0.092903
-  elseif fromU == "Square Inches" then sqMeters = val * 0.00064516
-  elseif fromU == "Acres" then sqMeters = val * 4046.86 end
-
-  if toU == "Square Kilometers" then return sqMeters / 1000000
-  elseif toU == "Square Feet" then return sqMeters / 0.092903
-  elseif toU == "Square Inches" then return sqMeters / 0.00064516
-  elseif toU == "Acres" then return sqMeters / 4046.86
-  else return sqMeters end
-end
-
-local function convertData(val, fromU, toU)
-  local mb = val
-  if fromU == "Kilobytes (KB)" then mb = val / 1024
-  elseif fromU == "Gigabytes (GB)" then mb = val * 1024
-  elseif fromU == "Terabytes (TB)" then mb = val * 1024 * 1024
-  elseif fromU == "Bytes" then mb = val / (1024 * 1024) end
-
-  if toU == "Kilobytes (KB)" then return mb * 1024
-  elseif toU == "Gigabytes (GB)" then return mb / 1024
-  elseif toU == "Terabytes (TB)" then return mb / (1024 * 1024)
-  elseif toU == "Bytes" then return mb * (1024 * 1024)
-  else return mb end
-end
-
-local function convertSpeed(val, fromU, toU)
-  local kmh = val
-  if fromU == "Meters/Sec (m/s)" then kmh = val * 3.6
-  elseif fromU == "Miles/Hour (mph)" then kmh = val * 1.60934
-  elseif fromU == "Knots" then kmh = val * 1.852 end
-
-  if toU == "Meters/Sec (m/s)" then return kmh / 3.6
-  elseif toU == "Miles/Hour (mph)" then return kmh / 1.60934
-  elseif toU == "Knots" then return kmh / 1.852
-  else return kmh end
-end
-
-local function convertTime(val, fromU, toU)
-  local sec = val
-  if fromU == "Minutes" then sec = val * 60
-  elseif fromU == "Hours" then sec = val * 3600
-  elseif fromU == "Days" then sec = val * 86400 end
-
-  if toU == "Minutes" then return sec / 60
-  elseif toU == "Hours" then return sec / 3600
-  elseif toU == "Days" then return sec / 86400
-  else return sec end
-end
-
-local function convertVolume(val, fromU, toU)
-  local ml = val
-  if fromU == "Liters" then ml = val * 1000
-  elseif fromU == "US Gallons" then ml = val * 3785.41 end
-
-  if toU == "Liters" then return ml / 1000
-  elseif toU == "US Gallons" then return ml / 3785.41
-  else return ml end
-end
-
-local function convertPower(val, fromU, toU)
-  local watts = val
-  if fromU == "Kilowatts (kW)" then watts = val * 1000
-  elseif fromU == "Horsepower (hp)" then watts = val * 745.7 end
-
-  if toU == "Kilowatts (kW)" then return watts / 1000
-  elseif toU == "Horsepower (hp)" then return watts / 745.7
-  else return watts end
-end
-
-local function convertPressure(val, fromU, toU)
-  local pascal = val
-  if fromU == "Bar" then pascal = val * 100000
-  elseif fromU == "PSI" then pascal = val * 6894.76
-  elseif fromU == "Atmosphere (atm)" then pascal = val * 101325 end
-
-  if toU == "Bar" then return pascal / 100000
-  elseif toU == "PSI" then return pascal / 6894.76
-  elseif toU == "Atmosphere (atm)" then return pascal / 101325
-  else return pascal end
-end
-
-local function convertEnergy(val, fromU, toU)
-  local joules = val
-  if fromU == "Calories (cal)" then joules = val * 4.184
-  elseif fromU == "Kilocalories (kcal)" then joules = val * 4184
-  elseif fromU == "Kilowatt-hours (kWh)" then joules = val * 3600000 end
-
-  if toU == "Calories (cal)" then return joules / 4.184
-  elseif toU == "Kilocalories (kcal)" then return joules / 4184
-  elseif toU == "Kilowatt-hours (kWh)" then return joules / 3600000
-  else return joules end
-end
-
-local function convertAngle(val, fromU, toU)
-  local deg = val
-  if fromU == "Radians" then deg = val * (180 / math.pi)
-  elseif fromU == "Gradians" then deg = val * 0.9 end
-
-  if toU == "Radians" then return deg * (math.pi / 180)
-  elseif toU == "Gradians" then return deg / 0.9
-  else return deg end
-end
-
-local function convertForce(val, fromU, toU)
-  local n = val
-  if fromU == "Kilonewtons (kN)" then n = val * 1000
-  elseif fromU == "Gram-force (gf)" then n = val * 0.00980665
-  elseif fromU == "Kilogram-force (kgf)" then n = val * 9.80665
-  elseif fromU == "Pound-force (lbf)" then n = val * 4.44822 end
-
-  if toU == "Kilonewtons (kN)" then return n / 1000
-  elseif toU == "Gram-force (gf)" then return n / 0.00980665
-  elseif toU == "Kilogram-force (kgf)" then return n / 9.80665
-  elseif toU == "Pound-force (lbf)" then return n / 4.44822
-  else return n end
-end
-
-local function convertFrequency(val, fromU, toU)
-  local hz = val
-  if fromU == "Kilohertz (kHz)" then hz = val * 1000
-  elseif fromU == "Megahertz (MHz)" then hz = val * 1000000
-  elseif fromU == "Gigahertz (GHz)" then hz = val * 1000000000 end
-
-  if toU == "Kilohertz (kHz)" then return hz / 1000
-  elseif toU == "Megahertz (MHz)" then return hz / 1000000
-  elseif toU == "Gigahertz (GHz)" then return hz / 1000000000
-  else return hz end
-end
-
-local function convertDataRate(val, fromU, toU)
-  local bps = val
-  if fromU == "Kilobits/sec (Kbps)" then bps = val * 1000
-  elseif fromU == "Megabits/sec (Mbps)" then bps = val * 1000000
-  elseif fromU == "Gigabits/sec (Gbps)" then bps = val * 1000000000 end
-
-  if toU == "Kilobits/sec (Kbps)" then return bps / 1000
-  elseif toU == "Megabits/sec (Mbps)" then return bps / 1000000
-  elseif toU == "Gigabits/sec (Gbps)" then return bps / 1000000000
-  else return bps end
-end
-
-local function convertFuel(val, fromU, toU)
-  local kml = val
-  if fromU == "Miles/Gallon (US)" then kml = val * 0.425144
-  elseif fromU == "Miles/Gallon (UK)" then kml = val * 0.354006 end
-
-  if toU == "Miles/Gallon (US)" then return kml / 0.425144
-  elseif toU == "Miles/Gallon (UK)" then return kml / 0.354006
-  else return kml end
-end
-
--- ==========================================
--- SMART CONVERTER UI BUILDER 
--- ==========================================
-local function openSmartConverterDialog(title, unitList, modeType)
-  speakText(title .. " opened.")
-  
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(30, 30, 30, 30)
-
-  local inputContainer = LinearLayout(activity)
-  inputContainer.setOrientation(LinearLayout.HORIZONTAL)
-  inputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-  
-  local inputEdit = EditText(activity)
-  inputEdit.setHint("Enter Value")
-  inputEdit.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL)
-  local inputParams = LinearLayout.LayoutParams(0, -2)
-  inputParams.weight = 1
-  inputEdit.setLayoutParams(inputParams)
-  inputContainer.addView(inputEdit)
-  
-  local inputClearBtn = Button(activity)
-  inputClearBtn.setText("X")
-  inputClearBtn.setContentDescription("Clear Input")
-  inputClearBtn.setTextColor(0xFFFFFFFF)
-  inputClearBtn.setBackgroundColor(0xFFFF3B30) 
-  local clearParams1 = LinearLayout.LayoutParams(-2, -2)
-  clearParams1.setMargins(10, 0, 10, 0)
-  inputClearBtn.setLayoutParams(clearParams1)
-  inputContainer.addView(inputClearBtn)
-
-  layout.addView(inputContainer)
-
-  local spinnerFrom = Spinner(activity)
-  local adapterFrom = ArrayAdapter(activity, android.R.layout.simple_spinner_item, unitList)
-  adapterFrom.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  spinnerFrom.setAdapter(adapterFrom)
-  layout.addView(spinnerFrom)
-
-  local space1 = TextView(activity)
-  space1.setText("\n")
-  space1.setTextSize(6)
-  layout.addView(space1)
-
-  local outputContainer = LinearLayout(activity)
-  outputContainer.setOrientation(LinearLayout.HORIZONTAL)
-  outputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-  
-  local outputEdit = EditText(activity)
-  outputEdit.setHint("Result")
-  outputEdit.setFocusable(false) 
-  outputEdit.setCursorVisible(false)
-  outputEdit.setTextColor(0xFF03DAC6)
-  local outputParams = LinearLayout.LayoutParams(0, -2)
-  outputParams.weight = 1
-  outputEdit.setLayoutParams(outputParams)
-  outputContainer.addView(outputEdit)
-
-  local outputClearBtn = Button(activity)
-  outputClearBtn.setText("X")
-  outputClearBtn.setContentDescription("Clear Output")
-  outputClearBtn.setTextColor(0xFFFFFFFF)
-  outputClearBtn.setBackgroundColor(0xFFFF3B30) 
-  local clearParams2 = LinearLayout.LayoutParams(-2, -2)
-  clearParams2.setMargins(10, 0, 10, 0)
-  outputClearBtn.setLayoutParams(clearParams2)
-  outputContainer.addView(outputClearBtn)
-  
-  layout.addView(outputContainer)
-
-  local spinnerTo = Spinner(activity)
-  local adapterTo = ArrayAdapter(activity, android.R.layout.simple_spinner_item, unitList)
-  adapterTo.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  spinnerTo.setAdapter(adapterTo)
-  layout.addView(spinnerTo)
-
-  inputClearBtn.setOnClickListener(View.OnClickListener{
-    onClick = function()
-      inputEdit.setText("")
-      outputEdit.setText("")
-      speakText("Input Cleared")
+function VP.saveSettings()
+    local f = io.open(VP.settingsPath, "w")
+    if f then
+        f:write("repeatMode=" .. VP.repeatMode .. "\n")
+        f:write("skipMs=" .. tostring(VP.skipMs) .. "\n")
+        f:write("speed=" .. tostring(VP.speed) .. "\n")
+        f:close()
     end
-  })
-
-  outputClearBtn.setOnClickListener(View.OnClickListener{
-    onClick = function()
-      outputEdit.setText("")
-      speakText("Output Cleared")
-    end
-  })
-
-  spinnerFrom.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-    onItemSelected = function(parent, view, position, id)
-      local selectedUnit = unitList[position + 1]
-      inputEdit.setHint("Enter " .. selectedUnit)
-    end
-  })
-
-  spinnerTo.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-    onItemSelected = function(parent, view, position, id)
-      local selectedUnit = unitList[position + 1]
-      outputEdit.setHint("Result in " .. selectedUnit)
-    end
-  })
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle(title)
-  dlg.setView(layout)
-
-  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil) 
-  
-  dlg.show()
-
-  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local valStr = inputEdit.getText().toString()
-      local numVal = tonumber(valStr)
-      if not numVal then
-        outputEdit.setText("")
-        speakText("Please enter a valid number in the first box!")
-        return
-      end
-
-      local uFrom = tostring(spinnerFrom.getSelectedItem())
-      local uTo = tostring(spinnerTo.getSelectedItem())
-      local output = 0
-
-      if modeType == "Length" then output = convertLength(numVal, uFrom, uTo)
-      elseif modeType == "Weight" then output = convertWeight(numVal, uFrom, uTo)
-      elseif modeType == "Temp" then output = convertTemp(numVal, uFrom, uTo)
-      elseif modeType == "Area" then output = convertArea(numVal, uFrom, uTo)
-      elseif modeType == "Data" then output = convertData(numVal, uFrom, uTo)
-      elseif modeType == "Speed" then output = convertSpeed(numVal, uFrom, uTo)
-      elseif modeType == "Time" then output = convertTime(numVal, uFrom, uTo)
-      elseif modeType == "Volume" then output = convertVolume(numVal, uFrom, uTo)
-      elseif modeType == "Power" then output = convertPower(numVal, uFrom, uTo)
-      elseif modeType == "Pressure" then output = convertPressure(numVal, uFrom, uTo)
-      elseif modeType == "Energy" then output = convertEnergy(numVal, uFrom, uTo)
-      elseif modeType == "Angle" then output = convertAngle(numVal, uFrom, uTo)
-      elseif modeType == "Force" then output = convertForce(numVal, uFrom, uTo)
-      elseif modeType == "Frequency" then output = convertFrequency(numVal, uFrom, uTo)
-      elseif modeType == "DataRate" then output = convertDataRate(numVal, uFrom, uTo)
-      elseif modeType == "Fuel" then output = convertFuel(numVal, uFrom, uTo)
-      end
-
-      local formattedOutput = string.format("%.8f", output)
-      if formattedOutput:find("%.") then
-        formattedOutput = formattedOutput:gsub("0+$", ""):gsub("%.$", "")
-      end
-
-      local outputStr = formattedOutput .. " " .. uTo
-      outputEdit.setText(outputStr)
-      
-      local finalString = valStr .. " " .. uFrom .. " is equal to " .. outputStr
-      table.insert(historyLog, valStr .. " " .. uFrom .. " = " .. outputStr)
-      speakText(finalString)
-    end
-  })
-
-  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local currentRes = outputEdit.getText().toString()
-      if currentRes == "" then
-        copyToClipboard("")
-      else
-        copyToClipboard(currentRes)
-      end
-    end
-  })
 end
 
-
--- ==========================================
--- BASIC MATH CALCULATOR DIALOG 
--- ==========================================
-local function openBasicCalculatorDialog()
-  speakText("Basic Math Calculator opened. Enter your math expression.")
-  
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(30, 30, 30, 30)
-
-  local inputContainer = LinearLayout(activity)
-  inputContainer.setOrientation(LinearLayout.HORIZONTAL)
-  inputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-  
-  local inputEdit = EditText(activity)
-  inputEdit.setHint("Enter Expression (e.g., 45+20*5)")
-  inputEdit.setInputType(InputType.TYPE_CLASS_TEXT) 
-  local inputParams = LinearLayout.LayoutParams(0, -2)
-  inputParams.weight = 1
-  inputEdit.setLayoutParams(inputParams)
-  inputContainer.addView(inputEdit)
-  
-  local inputClearBtn = Button(activity)
-  inputClearBtn.setText("X")
-  inputClearBtn.setContentDescription("Clear Expression")
-  inputClearBtn.setTextColor(0xFFFFFFFF)
-  inputClearBtn.setBackgroundColor(0xFFFF3B30)
-  local clearParams1 = LinearLayout.LayoutParams(-2, -2)
-  clearParams1.setMargins(10, 0, 10, 0)
-  inputClearBtn.setLayoutParams(clearParams1)
-  inputContainer.addView(inputClearBtn)
-
-  layout.addView(inputContainer)
-
-  local space1 = TextView(activity)
-  space1.setText("\n")
-  space1.setTextSize(6)
-  layout.addView(space1)
-
-  local outputContainer = LinearLayout(activity)
-  outputContainer.setOrientation(LinearLayout.HORIZONTAL)
-  outputContainer.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-  
-  local outputEdit = EditText(activity)
-  outputEdit.setHint("Result")
-  outputEdit.setFocusable(false)
-  outputEdit.setCursorVisible(false)
-  outputEdit.setTextColor(0xFF03DAC6)
-  local outputParams = LinearLayout.LayoutParams(0, -2)
-  outputParams.weight = 1
-  outputEdit.setLayoutParams(outputParams)
-  outputContainer.addView(outputEdit)
-
-  local outputClearBtn = Button(activity)
-  outputClearBtn.setText("X")
-  outputClearBtn.setContentDescription("Clear Result")
-  outputClearBtn.setTextColor(0xFFFFFFFF)
-  outputClearBtn.setBackgroundColor(0xFFFF3B30)
-  local clearParams2 = LinearLayout.LayoutParams(-2, -2)
-  clearParams2.setMargins(10, 0, 10, 0)
-  outputClearBtn.setLayoutParams(clearParams2)
-  outputContainer.addView(outputClearBtn)
-  
-  layout.addView(outputContainer)
-
-  inputClearBtn.setOnClickListener(View.OnClickListener{
-    onClick = function()
-      inputEdit.setText("")
-      outputEdit.setText("")
-      speakText("Expression Cleared")
-    end
-  })
-
-  outputClearBtn.setOnClickListener(View.OnClickListener{
-    onClick = function()
-      outputEdit.setText("")
-      speakText("Result Cleared")
-    end
-  })
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle("Basic Math Calculator")
-  dlg.setView(layout)
-
-  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
-  
-  dlg.show()
-
-  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local expr = inputEdit.getText().toString()
-      if expr == "" then
-        outputEdit.setText("")
-        speakText("Please enter a math expression!")
-        return
-      end
-
-      local safeExpression = expr
-      if safeExpression:sub(-1):match("[%+%-%*/%%]") then
-        safeExpression = safeExpression:sub(1, -2)
-      end
-      local expressionToEval = safeExpression:gsub("%%", "/100")
-      
-      local compiledFunc, loadErr = load("return " .. expressionToEval)
-      if compiledFunc then
-        local successFlag, calculationResult = pcall(compiledFunc)
-        if successFlag and calculationResult then
-          local finalStr = tostring(calculationResult)
-          outputEdit.setText(finalStr)
-          table.insert(historyLog, expr .. " = " .. finalStr)
-          speakText(expr .. " is equal to " .. finalStr)
-        else
-          outputEdit.setText("Error")
-          speakText("Calculation Error")
+function VP.loadSettings()
+    local f = io.open(VP.settingsPath, "r")
+    if f then
+        for line in f:lines() do
+            local k, v = line:match("^(%a+)=(.+)$")
+            if k == "repeatMode" then VP.repeatMode = v
+            elseif k == "skipMs" then VP.skipMs = tonumber(v) or 10000
+            elseif k == "speed" then VP.speed = tonumber(v) or 1.0
+            end
         end
-      else
-        outputEdit.setText("Invalid Expression")
-        speakText("Invalid Expression")
-      end
+        f:close()
     end
-  })
-
-  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local currentRes = outputEdit.getText().toString()
-      if currentRes == "" or currentRes == "Error" or currentRes == "Invalid Expression" then
-        copyToClipboard("")
-      else
-        copyToClipboard(currentRes)
-      end
-    end
-  })
 end
 
-
--- ==========================================
--- NEW: AGE & DATE CALCULATOR (Live Date Engine)
--- ==========================================
-local function openAgeCalculatorDialog()
-  speakText("Age and Date Calculator opened.")
-  
-  local layout = LinearLayout(activity)
-  layout.setOrientation(LinearLayout.VERTICAL)
-  layout.setPadding(30, 30, 30, 30)
-
-  -- Day Input
-  local lblD = TextView(activity)
-  lblD.setText("1. Enter Birth Day (1 to 31):")
-  lblD.setTextColor(0xFF03DAC6)
-  layout.addView(lblD)
-  
-  local editD = EditText(activity)
-  editD.setHint("e.g. 15")
-  editD.setInputType(InputType.TYPE_CLASS_NUMBER)
-  layout.addView(editD)
-
-  -- Month Input
-  local lblM = TextView(activity)
-  lblM.setText("\n2. Enter Birth Month (1 to 12):")
-  lblM.setTextColor(0xFF03DAC6)
-  layout.addView(lblM)
-  
-  local editM = EditText(activity)
-  editM.setHint("e.g. 8")
-  editM.setInputType(InputType.TYPE_CLASS_NUMBER)
-  layout.addView(editM)
-
-  -- Year Input
-  local lblY = TextView(activity)
-  lblY.setText("\n3. Enter Birth Year:")
-  lblY.setTextColor(0xFF03DAC6)
-  layout.addView(lblY)
-  
-  local editY = EditText(activity)
-  editY.setHint("e.g. 1995")
-  editY.setInputType(InputType.TYPE_CLASS_NUMBER)
-  layout.addView(editY)
-
-  -- Clear All Button
-  local clearBtn = Button(activity)
-  clearBtn.setText("Clear All Fields")
-  clearBtn.setTextColor(0xFFFFFFFF)
-  clearBtn.setBackgroundColor(0xFFFF3B30)
-  local btnParams = LinearLayout.LayoutParams(-1, -2)
-  btnParams.setMargins(0, 15, 0, 15)
-  clearBtn.setLayoutParams(btnParams)
-  layout.addView(clearBtn)
-
-  -- Result Output
-  local lblRes = TextView(activity)
-  lblRes.setText("Result:")
-  lblRes.setTextColor(0xFF03DAC6)
-  layout.addView(lblRes)
-
-  local outputEdit = EditText(activity)
-  outputEdit.setHint("Your exact age will appear here")
-  outputEdit.setFocusable(false)
-  outputEdit.setCursorVisible(false)
-  outputEdit.setTextColor(0xFFFFFFFF)
-  layout.addView(outputEdit)
-
-  clearBtn.setOnClickListener(View.OnClickListener{
-    onClick = function()
-      editD.setText("")
-      editM.setText("")
-      editY.setText("")
-      outputEdit.setText("")
-      speakText("All fields cleared")
+function VP.saveFavorites()
+    local f = io.open(VP.favoritesPath, "w")
+    if f then
+        for _, path in ipairs(VP.favorites) do f:write(path .. "\n") end
+        f:close()
     end
-  })
-
-  local dlg = LuaDialog(activity)
-  dlg.setTitle("Age & Date Calculator")
-  dlg.setView(layout)
-
-  dlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Calculate", function() end)
-  dlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Copy Result", function() end)
-  dlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
-  
-  dlg.show()
-
-  dlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local d1 = tonumber(editD.getText().toString())
-      local m1 = tonumber(editM.getText().toString())
-      local y1 = tonumber(editY.getText().toString())
-
-      if not d1 or not m1 or not y1 or d1 < 1 or d1 > 31 or m1 < 1 or m1 > 12 or y1 < 1900 then
-        outputEdit.setText("")
-        speakText("Please enter a valid Date of Birth!")
-        return
-      end
-
-      -- USING NATIVE ANDROID SYSTEM CALENDAR FOR 100% ACCURATE LIVE TIME
-      local cal = Calendar.getInstance()
-      local y2 = cal.get(Calendar.YEAR)
-      local m2 = cal.get(Calendar.MONTH) + 1 -- Java Calendar months are 0-based
-      local d2 = cal.get(Calendar.DAY_OF_MONTH)
-
-      local resY = y2 - y1
-      local resM = m2 - m1
-      local resD = d2 - d1
-
-      if resD < 0 then
-          resM = resM - 1
-          local prevMonth = m2 - 1
-          if prevMonth == 0 then prevMonth = 12 end
-          local daysInPrevMonth = 31
-          if prevMonth == 4 or prevMonth == 6 or prevMonth == 9 or prevMonth == 11 then 
-              daysInPrevMonth = 30
-          elseif prevMonth == 2 then
-            if (y2 % 4 == 0 and y2 % 100 ~= 0) or (y2 % 400 == 0) then daysInPrevMonth = 29 else daysInPrevMonth = 28 end
-          end
-          resD = resD + daysInPrevMonth
-      end
-      
-      if resM < 0 then
-          resY = resY - 1
-          resM = resM + 12
-      end
-
-      if resY < 0 then
-         outputEdit.setText("")
-         speakText("Birth year cannot be in the future!")
-         return
-      end
-
-      local resultStr = resY .. " Years, " .. resM .. " Months, " .. resD .. " Days"
-      outputEdit.setText(resultStr)
-      table.insert(historyLog, "DOB: " .. d1 .. "/" .. m1 .. "/" .. y1 .. " = Age: " .. resultStr)
-      speakText("Your exact age is " .. resultStr)
-    end
-  })
-
-  dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local currentRes = outputEdit.getText().toString()
-      if currentRes == "" then
-        copyToClipboard("")
-      else
-        copyToClipboard(currentRes)
-      end
-    end
-  })
 end
 
-
--- ==========================================
--- History and About Dialogs
--- ==========================================
-local function showHistoryDialog()
-  if #historyLog == 0 then
-    speakText("History is empty")
-    local emptyDlg = LuaDialog(activity)
-    emptyDlg.setTitle("Calculation History")
-    emptyDlg.setMessage("No calculations recorded yet.")
-    emptyDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
-    emptyDlg.show()
-    return
-  end
-
-  speakText("Showing calculation history")
-  local historyLayout = LinearLayout(activity)
-  historyLayout.setOrientation(LinearLayout.VERTICAL)
-  
-  local historyListView = ListView(activity)
-  local historyAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, historyLog)
-  historyListView.setAdapter(historyAdapter)
-  historyLayout.addView(historyListView)
-
-  local histDlg = LuaDialog(activity)
-  histDlg.setView(historyLayout)
-  histDlg.setTitle("Calculation History")
-  
-  histDlg.setButton(DialogInterface.BUTTON_NEUTRAL, "Share", function() end)
-  histDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Clear", function() end)
-  histDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
-  
-  histDlg.show()
-
-  histDlg.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      local historyText = table.concat(historyLog, "\n")
-      local shareIntent = Intent(Intent.ACTION_SEND)
-      shareIntent.setType("text/plain")
-      shareIntent.putExtra(Intent.EXTRA_TEXT, "Calculation History:\n\n" .. historyText .. "\n\n(Generated by Calculator Pro - By Hafiz Zeeshan)")
-      activity.startActivity(Intent.createChooser(shareIntent, "Share History Via"))
+function VP.loadFavorites()
+    VP.favorites = {}
+    local f = io.open(VP.favoritesPath, "r")
+    if f then
+        for line in f:lines() do
+            if line ~= "" then table.insert(VP.favorites, line) end
+        end
+        f:close()
     end
-  })
-
-  histDlg.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(View.OnClickListener{
-    onClick = function()
-      historyLog = {}
-      historyListView.setAdapter(ArrayAdapter(activity, android.R.layout.simple_list_item_1, historyLog))
-      speakText("History cleared")
-    end
-  })
 end
 
-local function showAboutDialog()
-  local msg = "Calculator Pro\n\nProject By: Hafiz Zeeshan\n\nDescription:\nCalculator Pro is an advanced, all-in-one calculator and smart converter toolkit. It is fully optimized for visually impaired users with native screen reader support.\n\nHow to Use:\nSelect any tool from the categorized list. Enter your value in the first box, and the result will automatically appear in the second box. Use the 'X' button to quickly clear fields, and 'Copy Result' to save your answers.\n\nThank you for using Calculator Pro!"
-  
-  speakText("About Calculator Pro. Project by Hafiz Zeeshan.")
-  
-  local abtDlg = LuaDialog(activity)
-  abtDlg.setTitle("About & Feedback")
-  abtDlg.setMessage(msg)
-  
-  abtDlg.setButton(DialogInterface.BUTTON_NEGATIVE, "Send Feedback", function()
+function VP.isFavorite(path)
+    for _, p in ipairs(VP.favorites) do
+        if p == path then return true end
+    end
+    return false
+end
+
+function VP.toggleFavorite(path)
+    for i, p in ipairs(VP.favorites) do
+        if p == path then
+            table.remove(VP.favorites, i)
+            VP.saveFavorites()
+            return false
+        end
+    end
+    table.insert(VP.favorites, 1, path)
+    VP.saveFavorites()
+    return true
+end
+
+function VP.saveRecent()
+    local f = io.open(VP.recentPath, "w")
+    if f then
+        for _, path in ipairs(VP.recentlyPlayed) do f:write(path .. "\n") end
+        f:close()
+    end
+end
+
+function VP.loadRecent()
+    VP.recentlyPlayed = {}
+    local f = io.open(VP.recentPath, "r")
+    if f then
+        for line in f:lines() do
+            if line ~= "" then table.insert(VP.recentlyPlayed, line) end
+        end
+        f:close()
+    end
+end
+
+function VP.addRecent(path)
+    for i, p in ipairs(VP.recentlyPlayed) do
+        if p == path then table.remove(VP.recentlyPlayed, i); break end
+    end
+    table.insert(VP.recentlyPlayed, 1, path)
+    while #VP.recentlyPlayed > VP.recentMax do
+        table.remove(VP.recentlyPlayed)
+    end
+    VP.saveRecent()
+end
+
+function VP.savePlaylists()
+    local f = io.open(VP.playlistsPath, "w")
+    if f then
+        for name, paths in pairs(VP.playlists) do
+            f:write(name .. "|" .. table.concat(paths, "\1") .. "\n")
+        end
+        f:close()
+    end
+end
+
+function VP.loadPlaylists()
+    VP.playlists = {}
+    local f = io.open(VP.playlistsPath, "r")
+    if f then
+        for line in f:lines() do
+            local name, list = line:match("^(.-)|(.*)$")
+            if name then
+                local paths = {}
+                for p in (list .. "\1"):gmatch("(.-)\1") do
+                    if p ~= "" then table.insert(paths, p) end
+                end
+                VP.playlists[name] = paths
+            end
+        end
+        f:close()
+    end
+end
+
+-- Resume Playback: har video ki last position yaad rakhta hai
+function VP.saveResume()
+    local f = io.open(VP.resumePath, "w")
+    if f then
+        for path, ms in pairs(VP.resumePositions) do
+            f:write(path .. "|" .. tostring(ms) .. "\n")
+        end
+        f:close()
+    end
+end
+
+function VP.loadResume()
+    VP.resumePositions = {}
+    local f = io.open(VP.resumePath, "r")
+    if f then
+        for line in f:lines() do
+            local path, ms = line:match("^(.-)|(%d+)$")
+            if path then VP.resumePositions[path] = tonumber(ms) end
+        end
+        f:close()
+    end
+end
+
+-- ===== Subtitles (.srt) =====
+function VP.parseSrtForVideo(videoPath)
+    VP.subtitleLines = {}
+    VP.subtitleVideoPath = videoPath
+    if not videoPath then return end
+    local srtPath = videoPath:gsub("%.[%a%d]+$", ".srt")
+    local f = io.open(srtPath, "r")
+    if not f then return end
+    local content = f:read("*a") or ""
+    f:close()
+
+    local function srtTimeToSec(h, m, s, ms)
+        return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) + tonumber(ms) / 1000
+    end
+
+    for block in (content .. "\n\n"):gmatch("(.-)\n\r?\n") do
+        local sh, sm, ss, sms, eh, em, es, ems, rest =
+            block:match("(%d+):(%d+):(%d+)[,.](%d+)%s*%-%-%>%s*(%d+):(%d+):(%d+)[,.](%d+)\r?\n?(.*)")
+        if sh then
+            local startSec = srtTimeToSec(sh, sm, ss, sms)
+            local endSec = srtTimeToSec(eh, em, es, ems)
+            local text = trimStrGlobal((rest or ""):gsub("\r", ""):gsub("\n", " "))
+            table.insert(VP.subtitleLines, {startSec = startSec, endSec = endSec, text = text})
+        end
+    end
+    table.sort(VP.subtitleLines, function(a, b) return a.startSec < b.startSec end)
+end
+
+function VP.getCurrentSubtitleLine(elapsedMs)
+    if #VP.subtitleLines == 0 then return nil end
+    local elapsedSec = (elapsedMs or 0) / 1000
+    for _, line in ipairs(VP.subtitleLines) do
+        if elapsedSec >= line.startSec and elapsedSec <= line.endSec then
+            return line.text
+        end
+    end
+    return nil
+end
+
+function VP.scanVideos()
+    VP.allVideos = {}
+    local resolver = this.getContentResolver()
+    local uri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+    local projection = {"title", "duration", "_data"}
+    local cursor = resolver.query(uri, projection, nil, nil, MediaStore.Video.Media.TITLE .. " ASC")
+    if cursor ~= nil then
+        while cursor.moveToNext() do
+            local title = cursor.getString(cursor.getColumnIndex("title"))
+            local duration = cursor.getLong(cursor.getColumnIndex("duration"))
+            local path = cursor.getString(cursor.getColumnIndex("_data"))
+            table.insert(VP.allVideos, {title = title, duration = duration, path = path})
+        end
+        cursor.close()
+    end
+    VP.videos = VP.allVideos
+    return #VP.allVideos
+end
+
+-- Global trim helper (lyrics parsing aur search dono is ko use karte hain)
+function trimStrGlobal(s)
+    return (s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+function MP.saveSettings()
+    local f = io.open(MP.settingsPath, "w")
+    if f then
+        f:write("repeatMode=" .. MP.repeatMode .. "\n")
+        f:write("shuffle=" .. tostring(MP.shuffle) .. "\n")
+        f:write("volume=" .. tostring(MP.volume) .. "\n")
+        f:write("speed=" .. tostring(MP.speed) .. "\n")
+        f:write("skipMs=" .. tostring(MP.skipMs) .. "\n")
+        f:write("eqPresetIndex=" .. tostring(MP.eqPresetIndex) .. "\n")
+        f:write("echoPreset=" .. tostring(MP.echoPreset) .. "\n")
+        f:write("bassBoostOn=" .. tostring(MP.bassBoostOn) .. "\n")
+        f:write("crossfadeOn=" .. tostring(MP.crossfadeOn) .. "\n")
+        f:write("crossfadeSec=" .. tostring(MP.crossfadeSec) .. "\n")
+        f:write("theme=" .. MP.theme .. "\n")
+        f:write("speechDuckingEnabled=" .. tostring(MP.speechDuckingEnabled) .. "\n")
+        f:close()
+    end
+end
+
+function MP.loadSettings()
+    local f = io.open(MP.settingsPath, "r")
+    if f then
+        for line in f:lines() do
+            local k, v = line:match("^(%a+)=(.+)$")
+            if k == "repeatMode" then MP.repeatMode = v
+            elseif k == "shuffle" then MP.shuffle = (v == "true")
+            elseif k == "volume" then MP.volume = tonumber(v) or 1.0
+            elseif k == "speed" then MP.speed = tonumber(v) or 1.0
+            elseif k == "skipMs" then MP.skipMs = tonumber(v) or 10000
+            elseif k == "eqPresetIndex" then MP.eqPresetIndex = tonumber(v) or -1
+            elseif k == "echoPreset" then MP.echoPreset = tonumber(v) or -1
+            elseif k == "bassBoostOn" then MP.bassBoostOn = (v == "true")
+            elseif k == "crossfadeOn" then MP.crossfadeOn = (v == "true")
+            elseif k == "crossfadeSec" then MP.crossfadeSec = tonumber(v) or 5
+            elseif k == "theme" then MP.theme = v
+            elseif k == "speechDuckingEnabled" then MP.speechDuckingEnabled = (v == "true")
+            end
+        end
+        f:close()
+    end
+end
+
+function MP.savePlaylists()
+    local f = io.open(MP.playlistsPath, "w")
+    if f then
+        for name, paths in pairs(MP.playlists) do
+            f:write(name .. "|" .. table.concat(paths, "\1") .. "\n")
+        end
+        f:close()
+    end
+end
+
+function MP.loadPlaylists()
+    MP.playlists = {}
+    local f = io.open(MP.playlistsPath, "r")
+    if f then
+        for line in f:lines() do
+            local name, list = line:match("^(.-)|(.*)$")
+            if name then
+                local paths = {}
+                for p in (list .. "\1"):gmatch("(.-)\1") do
+                    if p ~= "" then table.insert(paths, p) end
+                end
+                MP.playlists[name] = paths
+            end
+        end
+        f:close()
+    end
+end
+
+function MP.saveFavorites()
+    local f = io.open(MP.favoritesPath, "w")
+    if f then
+        for _, path in ipairs(MP.favorites) do f:write(path .. "\n") end
+        f:close()
+    end
+end
+
+function MP.loadFavorites()
+    MP.favorites = {}
+    local f = io.open(MP.favoritesPath, "r")
+    if f then
+        for line in f:lines() do
+            if line ~= "" then table.insert(MP.favorites, line) end
+        end
+        f:close()
+    end
+end
+
+function MP.isFavorite(path)
+    for _, p in ipairs(MP.favorites) do
+        if p == path then return true end
+    end
+    return false
+end
+
+function MP.toggleFavorite(path)
+    for i, p in ipairs(MP.favorites) do
+        if p == path then
+            table.remove(MP.favorites, i)
+            MP.saveFavorites()
+            return false
+        end
+    end
+    table.insert(MP.favorites, 1, path)
+    MP.saveFavorites()
+    return true
+end
+
+function MP.saveRecent()
+    local f = io.open(MP.recentPath, "w")
+    if f then
+        for _, path in ipairs(MP.recentlyPlayed) do f:write(path .. "\n") end
+        f:close()
+    end
+end
+
+function MP.loadRecent()
+    MP.recentlyPlayed = {}
+    local f = io.open(MP.recentPath, "r")
+    if f then
+        for line in f:lines() do
+            if line ~= "" then table.insert(MP.recentlyPlayed, line) end
+        end
+        f:close()
+    end
+end
+
+function MP.addRecent(path)
+    for i, p in ipairs(MP.recentlyPlayed) do
+        if p == path then table.remove(MP.recentlyPlayed, i); break end
+    end
+    table.insert(MP.recentlyPlayed, 1, path)
+    while #MP.recentlyPlayed > MP.recentMax do
+        table.remove(MP.recentlyPlayed)
+    end
+    MP.saveRecent()
+end
+
+-- ===== Lyrics (.lrc) =====
+-- Gaane ki path se ".mp3"/".m4a" waghera hata ke ".lrc" try karta hai (same naam, same folder)
+function MP.parseLrcForSong(songPath)
+    MP.lyricsLines = {}
+    MP.lyricsSongPath = songPath
+    if not songPath then return end
+    local lrcPath = songPath:gsub("%.[%a%d]+$", ".lrc")
+    local f = io.open(lrcPath, "r")
+    if not f then return end
+    for line in f:lines() do
+        for min, sec, hun, text in line:gmatch("%[(%d+):(%d+)%.?(%d*)%]([^%[]*)") do
+            local mn = tonumber(min) or 0
+            local sc = tonumber(sec) or 0
+            local hn = tonumber(hun) or 0
+            local totalSec = mn * 60 + sc + (hn / 100)
+            table.insert(MP.lyricsLines, {time = totalSec, text = trimStrGlobal(text)})
+        end
+    end
+    f:close()
+    table.sort(MP.lyricsLines, function(a, b) return a.time < b.time end)
+end
+
+function MP.getCurrentLyricLine(elapsedMs)
+    if #MP.lyricsLines == 0 then return nil end
+    local elapsedSec = (elapsedMs or 0) / 1000
+    local current = nil
+    for _, line in ipairs(MP.lyricsLines) do
+        if line.time <= elapsedSec then
+            current = line.text
+        else
+            break
+        end
+    end
+    return current
+end
+
+function MP.scanMusic()
+    MP.allSongs = {}
     pcall(function()
-      local defaultMsg = Uri.encode("Hello Hafiz Zeeshan! I am using Calculator Pro. I want to give feedback regarding this project.")
-      local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://api.whatsapp.com/send?phone=" .. whatsappNumber .. "&text=" .. defaultMsg))
-      activity.startActivity(intent)
+        local resolver = this.getContentResolver()
+        local uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        local projection = {"title", "artist", "duration", "_data"}
+        local selection = MediaStore.Audio.Media.IS_MUSIC .. " != 0"
+        local cursor = resolver.query(uri, projection, selection, nil, MediaStore.Audio.Media.TITLE .. " ASC")
+        if cursor ~= nil then
+            while cursor.moveToNext() do
+                local title = cursor.getString(cursor.getColumnIndex("title"))
+                local artist = cursor.getString(cursor.getColumnIndex("artist"))
+                local duration = cursor.getLong(cursor.getColumnIndex("duration"))
+                local path = cursor.getString(cursor.getColumnIndex("_data"))
+                table.insert(MP.allSongs, {title = title, artist = artist, duration = duration, path = path})
+            end
+            cursor.close()
+        end
     end)
-  end)
-  abtDlg.setButton(DialogInterface.BUTTON_POSITIVE, "Close", nil)
-  abtDlg.show()
+    MP.songs = MP.allSongs
+    return #MP.allSongs
 end
 
-
--- ==========================================
--- CATEGORY DATA STRUCTURE (FINAL VERIFIED)
--- ==========================================
-local categoryNames = {
-  "All Tools (Show Everything)",
-  "Math & General Tools",
-  "Everyday Converters",
-  "Physics & Engineering",
-  "Tech & Computing"
-}
-
-local categoryData = {
-  ["All Tools (Show Everything)"] = {
-    "Basic Math Calculator", "Age & Date Calculator", 
-    "Length Converter", "Weight Converter", "Temperature Converter", 
-    "Area Converter", "Volume Converter", "Time Converter", "Speed Converter", "Fuel Economy Converter",
-    "Power Converter", "Pressure Converter", "Energy Converter", "Angle Converter", "Force Converter", "Frequency Converter", 
-    "Data Storage Converter", "Data Rate Converter",
-    "View History Log", "About & Feedback"
-  },
-  ["Math & General Tools"] = {
-    "Basic Math Calculator", "Age & Date Calculator", 
-    "View History Log", "About & Feedback"
-  },
-  ["Everyday Converters"] = {
-    "Length Converter", "Weight Converter", "Temperature Converter", 
-    "Area Converter", "Volume Converter", "Time Converter", "Speed Converter", "Fuel Economy Converter",
-    "View History Log", "About & Feedback"
-  },
-  ["Physics & Engineering"] = {
-    "Power Converter", "Pressure Converter", "Energy Converter", "Angle Converter", "Force Converter", "Frequency Converter",
-    "View History Log", "About & Feedback"
-  },
-  ["Tech & Computing"] = {
-    "Data Storage Converter", "Data Rate Converter",
-    "View History Log", "About & Feedback"
-  }
-}
-
-local currentList = categoryData["All Tools (Show Everything)"]
-
--- ==========================================
--- Clean Categorized Home Screen
--- ==========================================
-local mainRootLayout = LinearLayout(activity)
-mainRootLayout.setOrientation(LinearLayout.VERTICAL)
-mainRootLayout.setLayoutParams(ViewGroup.LayoutParams(-1, -1))
-mainRootLayout.setBackgroundColor(0xFF121212)
-mainRootLayout.setPadding(25, 25, 25, 25)
-
-local headerText = TextView(activity)
-headerText.setText("CALCULATOR PRO\nProject By Hafiz Zeeshan")
-headerText.setTextColor(0xFFBB86FC)
-headerText.setTextSize(18)
-headerText.setGravity(Gravity.CENTER)
-headerText.setPadding(0, 20, 0, 30)
-mainRootLayout.addView(headerText)
-
--- Category Spinner Layout
-local catLabel = TextView(activity)
-catLabel.setText("Select Category:")
-catLabel.setTextColor(0xFF03DAC6)
-catLabel.setTextSize(15)
-mainRootLayout.addView(catLabel)
-
-local categorySpinner = Spinner(activity)
-local catAdapter = ArrayAdapter(activity, android.R.layout.simple_spinner_item, categoryNames)
-catAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-categorySpinner.setAdapter(catAdapter)
-mainRootLayout.addView(categorySpinner)
-
-local space2 = TextView(activity)
-space2.setText("\n")
-space2.setTextSize(6)
-mainRootLayout.addView(space2)
-
-local toolsListView = ListView(activity)
-local layoutParams = LinearLayout.LayoutParams(-1, -1)
-toolsListView.setLayoutParams(layoutParams)
-mainRootLayout.addView(toolsListView)
-
--- Function to Update List dynamically
-local function updateListView(category)
-  currentList = categoryData[category]
-  local listAdapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, currentList)
-  toolsListView.setAdapter(listAdapter)
-end
-
--- Initialize first load
-updateListView("All Tools (Show Everything)")
-
--- Spinner Selection Logic (Categories)
-local isInitialLoad = true
-categorySpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-  onItemSelected = function(parent, view, position, id)
-    local selectedCat = categoryNames[position + 1]
-    updateListView(selectedCat)
-    if not isInitialLoad then
-      speakText(selectedCat .. " category selected. " .. tostring(#currentList) .. " tools loaded.")
+function MP.applyEqualizer()
+    if MP.equalizer ~= nil then
+        pcall(function() MP.equalizer.release() end)
+        MP.equalizer = nil
     end
-    isInitialLoad = false
-  end
-})
+    if MP.player ~= nil then
+        local ok, eq = pcall(function() return Equalizer(0, MP.player.getAudioSessionId()) end)
+        if ok and eq ~= nil then
+            MP.equalizer = eq
+            if MP.eqPresetIndex >= 0 then
+                -- Kuch devices par preset lagane se pehle Equalizer enable karna zaroori hai,
+                -- lekin kuch par preset PEHLE lagana zaroori hai — dono order try karte hain
+                pcall(function()
+                    MP.equalizer.usePreset(MP.eqPresetIndex)
+                    MP.equalizer.setEnabled(true)
+                end)
+            else
+                pcall(function() MP.equalizer.setEnabled(false) end)
+            end
+        end
+    end
+    MP.reassertPauseState()
+end
 
--- List Click Logic (Tools)
-toolsListView.setOnItemClickListener(AdapterView.OnItemClickListener{
-  onItemClick = function(parent, view, position, id)
-    triggerVibration()
-    task(100, function()
-      local opt = currentList[position + 1]
-      if opt == "Basic Math Calculator" then openBasicCalculatorDialog()
-      elseif opt == "Age & Date Calculator" then openAgeCalculatorDialog()
-      elseif opt == "Length Converter" then openSmartConverterDialog("Length Converter", {"Meters", "Kilometers", "Centimeters", "Millimeters", "Inches", "Feet", "Yards"}, "Length")
-      elseif opt == "Weight Converter" then openSmartConverterDialog("Weight Converter", {"Kilograms", "Grams", "Milligrams", "Pounds", "Ounces"}, "Weight")
-      elseif opt == "Temperature Converter" then openSmartConverterDialog("Temperature Converter", {"Celsius", "Fahrenheit", "Kelvin"}, "Temp")
-      elseif opt == "Area Converter" then openSmartConverterDialog("Area Converter", {"Square Meters", "Square Kilometers", "Square Feet", "Square Inches", "Acres"}, "Area")
-      elseif opt == "Volume Converter" then openSmartConverterDialog("Volume Converter", {"Liters", "Milliliters", "US Gallons"}, "Volume")
-      elseif opt == "Time Converter" then openSmartConverterDialog("Time Converter", {"Seconds", "Minutes", "Hours", "Days"}, "Time")
-      elseif opt == "Data Storage Converter" then openSmartConverterDialog("Data Storage Converter", {"Megabytes (MB)", "Kilobytes (KB)", "Gigabytes (GB)", "Terabytes (TB)", "Bytes"}, "Data")
-      elseif opt == "Speed Converter" then openSmartConverterDialog("Speed Converter", {"Kilometers/Hour (km/h)", "Meters/Sec (m/s)", "Miles/Hour (mph)", "Knots"}, "Speed")
-      elseif opt == "Power Converter" then openSmartConverterDialog("Power Converter", {"Watts (W)", "Kilowatts (kW)", "Horsepower (hp)"}, "Power")
-      elseif opt == "Pressure Converter" then openSmartConverterDialog("Pressure Converter", {"Pascal (Pa)", "Bar", "PSI", "Atmosphere (atm)"}, "Pressure")
-      elseif opt == "Energy Converter" then openSmartConverterDialog("Energy Converter", {"Joules (J)", "Calories (cal)", "Kilocalories (kcal)", "Kilowatt-hours (kWh)"}, "Energy")
-      elseif opt == "Angle Converter" then openSmartConverterDialog("Angle Converter", {"Degrees", "Radians", "Gradians"}, "Angle")
-      elseif opt == "Force Converter" then openSmartConverterDialog("Force Converter", {"Newtons (N)", "Kilonewtons (kN)", "Gram-force (gf)", "Kilogram-force (kgf)", "Pound-force (lbf)"}, "Force")
-      elseif opt == "Frequency Converter" then openSmartConverterDialog("Frequency Converter", {"Hertz (Hz)", "Kilohertz (kHz)", "Megahertz (MHz)", "Gigahertz (GHz)"}, "Frequency")
-      elseif opt == "Data Rate Converter" then openSmartConverterDialog("Data Rate Converter", {"Bits/sec (bps)", "Kilobits/sec (Kbps)", "Megabits/sec (Mbps)", "Gigabits/sec (Gbps)"}, "DataRate")
-      elseif opt == "Fuel Economy Converter" then openSmartConverterDialog("Fuel Economy Converter", {"Kilometers/Liter (km/L)", "Miles/Gallon (US)", "Miles/Gallon (UK)"}, "Fuel")
-      elseif opt == "View History Log" then showHistoryDialog()
-      elseif opt == "About & Feedback" then showAboutDialog()
-      end
+-- Echo (PresetReverb, jaise mosque/hall wali double-triple awaz) aur Bass Boost
+function MP.applySoundEffects()
+    if MP.presetReverb ~= nil then
+        pcall(function() MP.presetReverb.release() end)
+        MP.presetReverb = nil
+    end
+    if MP.bassBoost ~= nil then
+        pcall(function() MP.bassBoost.release() end)
+        MP.bassBoost = nil
+    end
+    if MP.player == nil then return end
+    local sessionId = MP.player.getAudioSessionId()
+
+    if MP.echoPreset >= 0 then
+        local ok, pr = pcall(function() return PresetReverb(0, sessionId) end)
+        if ok and pr ~= nil then
+            MP.presetReverb = pr
+            pcall(function()
+                MP.presetReverb.setPreset(MP.echoPreset)
+                MP.presetReverb.setEnabled(true)
+                -- PresetReverb ek "auxiliary" effect hai — sirf banane se kaam nahi chalta,
+                -- player ki awaz is se explicitly route (attach) karni parti hai, warna
+                -- effect on hokar bhi sunayi nahi deta.
+                MP.player.attachAuxEffect(MP.presetReverb.getId())
+                MP.player.setAuxEffectSendLevel(1.0)
+            end)
+        end
+    else
+        pcall(function() MP.player.setAuxEffectSendLevel(0.0) end)
+    end
+
+    if MP.bassBoostOn then
+        local ok2, bb = pcall(function() return BassBoost(0, sessionId) end)
+        if ok2 and bb ~= nil then
+            MP.bassBoost = bb
+            pcall(function()
+                -- Kuch devices/headphones Bass Boost support hi nahi karte — is check ke
+                -- bawajood bhi hum lagane ki koshish karte hain (kuch devices galat False
+                -- report karte hain), bas crash nahi hone dete
+                local supported = true
+                pcall(function() supported = MP.bassBoost.getStrengthSupported() end)
+                MP.bassBoost.setStrength(900)
+                MP.bassBoost.setEnabled(true)
+            end)
+        end
+    end
+
+    MP.reassertPauseState()
+end
+
+-- Kuch devices par gaana start hote hi turant Equalizer/Bass Boost lagane se asar nahi hota
+-- (audio session abhi poori tarah "ready" nahi hota) — thodi der baad dobara laga dete hain
+-- taake pakka apply ho jaye
+function MP.reapplyEffectsDelayed()
+    pcall(function()
+        seekProgress.postDelayed(function()
+            MP.applyEqualizer()
+            MP.applySoundEffects()
+        end, 350)
     end)
-  end
-})
+end
 
-activity.setContentView(mainRootLayout)
+function MP.playIndex(idx)
+    if #MP.songs == 0 then
+        service.speak("Koi gaana nahi mila, pehle scan karein")
+        return
+    end
+    if idx < 1 then idx = #MP.songs end
+    if idx > #MP.songs then idx = 1 end
+    MP.currentIndex = idx
+    local song = MP.songs[idx]
 
--- App Startup
-task(500, function()
-  speakText("Calculator Pro Started. Project By Hafiz Zeeshan. Use the category dropdown to filter tools.")
+    if MP.player ~= nil then
+        MP.player.stop()
+        MP.player.release()
+        MP.player = nil
+    end
+
+    MP.player = MediaPlayer()
+    MP.player.reset()
+    MP.player.setDataSource(song.path)
+    MP.player.prepare()
+    MP.player.setVolume(MP.volume, MP.volume)
+    MP.player.start()
+    MP.isPlaying = true
+
+    MP.player.setOnCompletionListener(luajava.createProxy(
+        "android.media.MediaPlayer$OnCompletionListener",
+        { onCompletion = function(mp) MP.onSongComplete() end }
+    ))
+
+    MP.applyEqualizer()
+    MP.applySoundEffects()
+    MP.reapplyEffectsDelayed()
+    MP.parseLrcForSong(song.path)
+    MP.addRecent(song.path)
+    if MP.onSongChangedUI then MP.onSongChangedUI() end
+    service.speak((song.title or "Unknown") .. " - " .. (song.artist or "Unknown Artist"))
+end
+
+function MP.onSongComplete()
+    if MP.repeatMode == "one" then
+        MP.playIndex(MP.currentIndex)
+    elseif MP.shuffle then
+        math.randomseed(os.time())
+        MP.playIndex(math.random(1, #MP.songs))
+    elseif MP.repeatMode == "all" then
+        MP.playIndex(MP.currentIndex + 1)
+    else
+        if MP.currentIndex < #MP.songs then
+            MP.playIndex(MP.currentIndex + 1)
+        else
+            MP.isPlaying = false
+            service.speak("Playlist khatam ho gayi")
+        end
+    end
+end
+
+function MP.togglePlayPause()
+    if MP.player == nil then
+        if #MP.songs > 0 then MP.playIndex(1) end
+        return
+    end
+    if MP.isPlaying then
+        MP.player.pause()
+        MP.isPlaying = false
+        service.speak("Pause")
+    else
+        MP.player.start()
+        MP.isPlaying = true
+        service.speak("Play")
+    end
+end
+
+function MP.next() MP.playIndex(MP.currentIndex + 1) end
+function MP.prev() MP.playIndex(MP.currentIndex - 1) end
+
+function MP.seekTo(ms)
+    if MP.player ~= nil then MP.player.seekTo(ms) end
+end
+
+function MP.setVolume(v)
+    MP.volume = v
+    if MP.player ~= nil then MP.player.setVolume(v, v) end
+    MP.saveSettings()
+end
+
+function MP.setSpeed(s)
+    MP.speed = s
+    if MP.player ~= nil then
+        local ok = pcall(function()
+            local params = MP.player.getPlaybackParams()
+            params.setSpeed(s)
+            MP.player.setPlaybackParams(params)
+        end)
+        if not ok then service.speak("Speed change is Android version par support nahi") end
+    end
+    MP.saveSettings()
+end
+
+function MP.formatTime(ms)
+    local totalSec = math.floor((ms or 0) / 1000)
+    local min = math.floor(totalSec / 60)
+    local sec = totalSec % 60
+    return string.format("%d:%02d", min, sec)
+end
+
+-- Kuch devices (jaise Samsung/Exynos audio hardware) par jab Equalizer/PresetReverb/BassBoost
+-- ko chal rahe gaane ke real audio session se attach kiya jata hai, to audio hardware KHUD
+-- track ko resume kar deta hai — chahe gaana pehle se pause ho. Yehi wajah thi ke Settings
+-- ya Echo/Bass change karne par pause kiya hua gaana khud chalne lag jata tha. Ye function
+-- MP.isPlaying (jo hamara asal, intended state hai) ke mutabiq wapas pause kar deta hai —
+-- is se ye OS-level side effect hamesha cancel ho jayega.
+function MP.reassertPauseState()
+    if MP.player ~= nil and not MP.isPlaying then
+        pcall(function()
+            if MP.player.isPlaying() then
+                MP.player.pause()
+            end
+        end)
+    end
+end
+
+-- ===== Speech Ducking =====
+-- Jab bhi app kuch bolta hai (service.speak), gaana/video ki awaz thodi der ke liye halki
+-- kar dete hain taake screen-reader ki awaz saaf sunayi de, phir wapas normal volume par —
+-- bilkul waisa hi jaisa reference code mein duckVolumeTemporarily karta tha
+function MP.duckVolumeTemporarily(durationMs)
+    if not MP.speechDuckingEnabled then return end
+    pcall(function()
+        if MP.player ~= nil then MP.player.setVolume(0.2, 0.2) end
+    end)
+    pcall(function()
+        if VP.currentPlayerRef ~= nil then VP.currentPlayerRef.setVolume(0.2, 0.2) end
+    end)
+    MP.duckToken = MP.duckToken + 1
+    local myToken = MP.duckToken
+    pcall(function()
+        seekProgress.postDelayed(function()
+            if myToken == MP.duckToken then
+                pcall(function()
+                    if MP.player ~= nil then MP.player.setVolume(MP.volume, MP.volume) end
+                end)
+                pcall(function()
+                    if VP.currentPlayerRef ~= nil then VP.currentPlayerRef.setVolume(1.0, 1.0) end
+                end)
+            end
+        end, durationMs)
+    end)
+end
+
+-- ===== Voice Pitch & Degree Speech =====
+-- Reference code jaisa hi: dono ek hi PlaybackParams par pitch aur speed together lagate
+-- hain, aur har tap par agli preset value par cycle karte hain
+local pitchDegreeValues = {1.0, 1.125, 1.25, 1.375, 1.5}
+
+function MP.applyVoicePitchSpeed()
+    pcall(function()
+        if MP.player ~= nil then
+            local params = MP.player.getPlaybackParams()
+            params.setPitch(MP.voicePitch)
+            params.setSpeed(MP.voiceSpeedDegree)
+            MP.player.setPlaybackParams(params)
+        end
+    end)
+    pcall(function()
+        if VP.currentPlayerRef ~= nil then
+            local params = VP.currentPlayerRef.getPlaybackParams()
+            params.setPitch(MP.voicePitch)
+            params.setSpeed(MP.voiceSpeedDegree)
+            VP.currentPlayerRef.setPlaybackParams(params)
+        end
+    end)
+    MP.reassertPauseState()
+end
+
+function MP.cycleVoicePitch()
+    MP.pitchIndex = MP.pitchIndex % #pitchDegreeValues + 1
+    MP.voicePitch = pitchDegreeValues[MP.pitchIndex]
+    MP.applyVoicePitchSpeed()
+    service.speak("Voice pitch " .. MP.voicePitch)
+end
+
+function MP.cycleVoicePitchDown()
+    MP.pitchIndex = MP.pitchIndex - 1
+    if MP.pitchIndex < 1 then MP.pitchIndex = #pitchDegreeValues end
+    MP.voicePitch = pitchDegreeValues[MP.pitchIndex]
+    MP.applyVoicePitchSpeed()
+    service.speak("Voice pitch " .. MP.voicePitch)
+end
+
+function MP.cycleDegreeSpeech()
+    MP.speedDegreeIndex = MP.speedDegreeIndex % #pitchDegreeValues + 1
+    MP.voiceSpeedDegree = pitchDegreeValues[MP.speedDegreeIndex]
+    MP.applyVoicePitchSpeed()
+    service.speak("Degree speech " .. MP.voiceSpeedDegree)
+end
+
+-- ===== Backup / Restore =====
+-- Settings + Playlists + Favorites + Recent, sab ek hi file mein combine karke save/restore karta hai
+-- ===== Theme (Light/Dark) =====
+-- Screen-reader users ke liye main cheez functionality hai, lekin kam-nazar (low vision) users
+-- ke liye background/text contrast bhi zaroori ho sakta hai — is liye simple toggle
+-- ===== Now Playing Notification =====
+-- NOTE: Lock-screen/notification par functional Play/Pause/Next buttons banane ke liye Android
+-- ko ek BroadcastReceiver chahiye hota hai jo sirf app ke Manifest mein register ho sakta hai —
+-- AndroLua/Jieshuo plugin (jo khud ek installed app nahi, balke accessibility service ke andar
+-- chalne wala script hai) is se register nahi kar sakta. Is liye ye sirf "Now Playing" info
+-- dikhata hai (gaana kaunsa chal raha hai), functional buttons is environment mein possible nahi.
+MP.notificationChannelId = "advance_media_player_channel"
+MP.notificationId = 1001
+
+function MP.ensureNotificationChannel()
+    if Build.VERSION.SDK_INT >= 26 then
+        pcall(function()
+            local nm = this.getSystemService("notification")
+            local channel = NotificationChannel(MP.notificationChannelId, "Advance Media Player", NotificationManager.IMPORTANCE_LOW)
+            nm.createNotificationChannel(channel)
+        end)
+    end
+end
+
+function MP.showNowPlayingNotification(title, subtitle)
+    pcall(function()
+        MP.ensureNotificationChannel()
+        local nm = this.getSystemService("notification")
+        local iconRes = this.getApplicationInfo().icon
+        local builder
+        if Build.VERSION.SDK_INT >= 26 then
+            builder = Notification.Builder(this, MP.notificationChannelId)
+        else
+            builder = Notification.Builder(this)
+        end
+        builder.setContentTitle(title)
+        builder.setContentText(subtitle)
+        builder.setSmallIcon(iconRes)
+        builder.setOngoing(true)
+        local notif = builder.build()
+        nm.notify(MP.notificationId, notif)
+    end)
+end
+
+function MP.clearNowPlayingNotification()
+    pcall(function()
+        local nm = this.getSystemService("notification")
+        nm.cancel(MP.notificationId)
+    end)
+end
+
+function MP.applyTheme()
+    local bg, fg
+    if MP.theme == "dark" then
+        bg = 0xFF121212
+        fg = 0xFFFFFFFF
+    else
+        bg = 0xFFFFFFFF
+        fg = 0xFF000000
+    end
+    pcall(function() activity.getWindow().getDecorView().setBackgroundColor(bg) end)
+    pcall(function() txtTitle.setTextColor(fg) end)
+    pcall(function() txtSong.setTextColor(fg) end)
+    pcall(function() txtLyric.setTextColor(fg) end)
+    pcall(function() txtTime.setTextColor(fg) end)
+end
+
+function MP.exportBackup()
+    local f = io.open(MP.backupPath, "w")
+    if not f then return false end
+
+    f:write("[SETTINGS]\n")
+    f:write("repeatMode=" .. MP.repeatMode .. "\n")
+    f:write("shuffle=" .. tostring(MP.shuffle) .. "\n")
+    f:write("volume=" .. tostring(MP.volume) .. "\n")
+    f:write("speed=" .. tostring(MP.speed) .. "\n")
+    f:write("skipMs=" .. tostring(MP.skipMs) .. "\n")
+    f:write("eqPresetIndex=" .. tostring(MP.eqPresetIndex) .. "\n")
+    f:write("echoPreset=" .. tostring(MP.echoPreset) .. "\n")
+    f:write("bassBoostOn=" .. tostring(MP.bassBoostOn) .. "\n")
+
+    f:write("[PLAYLISTS]\n")
+    for name, paths in pairs(MP.playlists) do
+        f:write(name .. "|" .. table.concat(paths, "\1") .. "\n")
+    end
+
+    f:write("[FAVORITES]\n")
+    for _, path in ipairs(MP.favorites) do
+        f:write(path .. "\n")
+    end
+
+    f:write("[RECENT]\n")
+    for _, path in ipairs(MP.recentlyPlayed) do
+        f:write(path .. "\n")
+    end
+
+    f:close()
+    return true
+end
+
+function MP.importBackup()
+    local f = io.open(MP.backupPath, "r")
+    if not f then return false end
+
+    local section = nil
+    MP.playlists = {}
+    MP.favorites = {}
+    MP.recentlyPlayed = {}
+
+    for line in f:lines() do
+        if line == "[SETTINGS]" or line == "[PLAYLISTS]" or line == "[FAVORITES]" or line == "[RECENT]" then
+            section = line
+        elseif section == "[SETTINGS]" then
+            local k, v = line:match("^(%a+)=(.+)$")
+            if k == "repeatMode" then MP.repeatMode = v
+            elseif k == "shuffle" then MP.shuffle = (v == "true")
+            elseif k == "volume" then MP.volume = tonumber(v) or 1.0
+            elseif k == "speed" then MP.speed = tonumber(v) or 1.0
+            elseif k == "skipMs" then MP.skipMs = tonumber(v) or 10000
+            elseif k == "eqPresetIndex" then MP.eqPresetIndex = tonumber(v) or -1
+            elseif k == "echoPreset" then MP.echoPreset = tonumber(v) or -1
+            elseif k == "bassBoostOn" then MP.bassBoostOn = (v == "true")
+            end
+        elseif section == "[PLAYLISTS]" then
+            local name, list = line:match("^(.-)|(.*)$")
+            if name then
+                local paths = {}
+                for p in (list .. "\1"):gmatch("(.-)\1") do
+                    if p ~= "" then table.insert(paths, p) end
+                end
+                MP.playlists[name] = paths
+            end
+        elseif section == "[FAVORITES]" then
+            if line ~= "" then table.insert(MP.favorites, line) end
+        elseif section == "[RECENT]" then
+            if line ~= "" then table.insert(MP.recentlyPlayed, line) end
+        end
+    end
+    f:close()
+
+    MP.saveSettings()
+    MP.savePlaylists()
+    MP.saveFavorites()
+    MP.saveRecent()
+    return true
+end
+
+-- ================= UI =================
+MP.loadSettings()
+MP.loadPlaylists()
+MP.loadFavorites()
+MP.loadRecent()
+VP.loadSettings()
+VP.loadFavorites()
+VP.loadRecent()
+VP.loadPlaylists()
+VP.loadResume()
+
+-- NOTE: Search ab "Search" button dabane par GridView dialog dikhata hai (dynamic view-add
+-- approach hata di gayi hai — wo hi Settings-misclick bug ki asal wajah thi).
+local layout = {
+    ScrollView, layout_width = "fill", layout_height = "fill",
+    { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "16dp", layout_width = "fill", layout_height = "wrap",
+        { TextView, id = "txtTitle", text = "Advance Media Player (Audio + Video)", textSize = "20sp", gravity = "center", layout_width = "fill", layout_height = "wrap" },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+            { EditText, id = "txtSearch", hint = "Search song...", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+            { Button, id = "btnSearchGo", text = "Search", layout_width = "wrap", layout_height = "wrap" },
+            { Button, id = "btnSearchClear", text = "Clear", layout_width = "wrap", layout_height = "wrap" },
+        },
+        { TextView, id = "txtSong", text = "No song playing", textSize = "16sp", gravity = "center", singleLine = true, ellipsize = "end", layout_width = "fill", layout_height = "wrap" },
+        { TextView, id = "txtLyric", text = "", textSize = "14sp", gravity = "center", singleLine = true, ellipsize = "end", layout_width = "fill", layout_height = "wrap" },
+        { TextView, id = "txtTime", text = "0:00 / 0:00", gravity = "center", layout_width = "fill", layout_height = "wrap" },
+        { SeekBar, id = "seekProgress", layout_width = "fill", layout_height = "wrap" },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+            { Button, id = "btnPrev", text = "Previous" },
+            { Button, id = "btnRewind", text = "Rewind" },
+        },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+            { Button, id = "btnPlayPause", text = "Play" },
+        },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+            { Button, id = "btnForward", text = "Forward" },
+            { Button, id = "btnNext", text = "Next" },
+        },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+            { Button, id = "btnSetA", text = "A-B Repeat: Loop Start", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+            { Button, id = "btnSetB", text = "A-B Repeat: Loop End", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+            { Button, id = "btnClearAB", text = "A-B Repeat: Clear", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+        },
+        { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+            { Button, id = "btnVoicePitchDown", text = "Voice Pitch -", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+            { Button, id = "btnVoicePitch", text = "Voice Pitch +", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+        },
+        { Button, id = "btnDegreeSpeech", text = "Degree Speech", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnFavToggle", text = "Favorite Karein", layout_width = "fill", layout_height = "wrap" },
+        { TextView, text = "Volume", layout_width = "fill", layout_height = "wrap" },
+        { SeekBar, id = "seekVolume", max = 100, progress = 100, layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnSongList", text = "Song List", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnLibrary", text = "Library (Favorites / Recent / Folders)", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnPlaylist", text = "Playlists", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnScan", text = "Scan / Rescan Music", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnVideoPlayer", text = "Video Player Kholein", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnLatest", text = "Online Media Player", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnSettings", text = "Settings", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnAbout", text = "About & Support", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "btnExitApp", text = "Exit", layout_width = "fill", layout_height = "wrap" },
+    }
+}
+
+activity.setContentView(loadlayout(layout))
+MP.applyTheme()
+
+-- service.speak() ko wrap kar dete hain taake app ki HAR announcement se pehle khud-ba-khud
+-- volume duck ho jaye (reference code mein ye UtteranceProgressListener se hota tha; yahan
+-- hum seedha service.speak ko hi wrap kar rahe hain taake har jagah alag se likhna na pade)
+local __originalServiceSpeak = service.speak
+pcall(function()
+    service.speak = function(text)
+        MP.duckVolumeTemporarily(800)
+        __originalServiceSpeak(text)
+    end
+end)
+
+local function updateFavToggleLabel()
+    if MP.currentIndex >= 1 and MP.currentIndex <= #MP.songs then
+        local song = MP.songs[MP.currentIndex]
+        if MP.isFavorite(song.path) then
+            btnFavToggle.setText("Favorite Hai (Nikalein)")
+        else
+            btnFavToggle.setText("Favorite Karein")
+        end
+    else
+        btnFavToggle.setText("Favorite Karein")
+    end
+end
+
+local function updateSongLabel()
+    if MP.currentIndex >= 1 and MP.currentIndex <= #MP.songs then
+        local song = MP.songs[MP.currentIndex]
+        txtSong.setText((song.title or "Unknown") .. " - " .. (song.artist or "Unknown Artist"))
+        MP.showNowPlayingNotification(song.title or "Unknown", (song.artist or "Unknown Artist") .. (MP.isPlaying and "" or " (Paused)"))
+    else
+        txtSong.setText("No song playing")
+        MP.clearNowPlayingNotification()
+    end
+    updateFavToggleLabel()
+    txtLyric.setText("")
+end
+
+MP.onSongChangedUI = function()
+    updateFavToggleLabel()
+end
+
+local function updatePlayPauseLabel()
+    btnPlayPause.setText(MP.isPlaying and "Pause" or "Play")
+    if MP.currentIndex >= 1 and MP.currentIndex <= #MP.songs then
+        local song = MP.songs[MP.currentIndex]
+        MP.showNowPlayingNotification(song.title or "Unknown", (song.artist or "Unknown Artist") .. (MP.isPlaying and "" or " (Paused)"))
+    end
+end
+
+local function updateSkipLabels()
+    local secs = math.floor(MP.skipMs / 1000)
+    btnRewind.setText("Rewind " .. secs .. "s")
+    btnForward.setText("Forward " .. secs .. "s")
+end
+
+local crossfadeTimerToken = 0
+
+-- Ek gaana khatam hone se MP.crossfadeSec second pehle agla gaana dheere dheere shuru kar deta
+-- hai, purane ki awaz kam hote hote aur naye ki awaz badhte badhte — dono overlap hote hain
+local function startCrossfade()
+    if MP.isCrossfading or #MP.songs == 0 or MP.player == nil then return end
+    local nextIdx = MP.currentIndex + 1
+    if nextIdx > #MP.songs then
+        if MP.repeatMode == "all" then nextIdx = 1 else return end
+    end
+    local nextSong = MP.songs[nextIdx]
+    if not nextSong then return end
+
+    MP.isCrossfading = true
+    crossfadeTimerToken = crossfadeTimerToken + 1
+    local myToken = crossfadeTimerToken
+    local oldPlayer = MP.player
+
+    -- Purane player ka completion listener hata dein taake wo khud MP.onSongComplete ko
+    -- dobara na bula de (hum manually switch kar rahe hain)
+    pcall(function() oldPlayer.setOnCompletionListener(nil) end)
+
+    local newPlayer = nil
+    local ok = pcall(function()
+        newPlayer = MediaPlayer()
+        newPlayer.reset()
+        newPlayer.setDataSource(nextSong.path)
+        newPlayer.prepare()
+        newPlayer.setVolume(0, 0)
+        newPlayer.start()
+    end)
+    if not ok or newPlayer == nil then
+        MP.isCrossfading = false
+        return
+    end
+
+    local steps = 10
+    local stepMs = math.floor((MP.crossfadeSec * 1000) / steps)
+    local stepNum = 0
+
+    local function fadeStep()
+        if myToken ~= crossfadeTimerToken then return end
+        stepNum = stepNum + 1
+        local ratio = stepNum / steps
+        pcall(function()
+            oldPlayer.setVolume(MP.volume * (1 - ratio), MP.volume * (1 - ratio))
+            newPlayer.setVolume(MP.volume * ratio, MP.volume * ratio)
+        end)
+        if stepNum < steps then
+            seekProgress.postDelayed(fadeStep, stepMs)
+        else
+            pcall(function() oldPlayer.stop() end)
+            pcall(function() oldPlayer.release() end)
+            MP.player = newPlayer
+            MP.currentIndex = nextIdx
+            MP.isPlaying = true
+            pcall(function()
+                MP.player.setOnCompletionListener(luajava.createProxy(
+                    "android.media.MediaPlayer$OnCompletionListener",
+                    { onCompletion = function(mp) MP.onSongComplete() end }
+                ))
+            end)
+            MP.applyEqualizer()
+            MP.applySoundEffects()
+            MP.reapplyEffectsDelayed()
+            MP.parseLrcForSong(nextSong.path)
+            MP.addRecent(nextSong.path)
+            MP.abPointA = nil
+            MP.abPointB = nil
+            MP.abRepeatOn = false
+            updateSongLabel()
+            updatePlayPauseLabel()
+            MP.isCrossfading = false
+        end
+    end
+    fadeStep()
+end
+
+local function progressLoop()
+    -- User tool ke bahar chala jaye (home dabaye, koi aur app kholein, waghera) to gaana
+    -- khud-ba-khud ruk jana chahiye — har second check karte hain ke app ki window abhi
+    -- foreground mein hai ya nahi
+    local hasFocusOk, hasFocus = pcall(function() return activity.hasWindowFocus() end)
+    if hasFocusOk and not hasFocus and MP.isPlaying then
+        pcall(function() MP.player.pause() end)
+        MP.isPlaying = false
+        pcall(updatePlayPauseLabel)
+    end
+
+    if MP.player ~= nil and MP.isPlaying then
+        local ok1, cur = pcall(function() return MP.player.getCurrentPosition() end)
+        local ok2, dur = pcall(function() return MP.player.getDuration() end)
+        if ok1 and ok2 then
+            seekProgress.setMax(dur)
+            seekProgress.setProgress(cur)
+            txtTime.setText(MP.formatTime(cur) .. " / " .. MP.formatTime(dur))
+            local lyricLine = MP.getCurrentLyricLine(cur)
+            txtLyric.setText(lyricLine or "")
+
+            -- A-B Repeat: Point B tak pahunchte hi wapas Point A par
+            if MP.abRepeatOn and MP.abPointA and MP.abPointB and cur >= MP.abPointB then
+                MP.seekTo(MP.abPointA)
+            end
+
+            -- Crossfade: gaana khatam hone se thodi der pehle agla shuru kar dein
+            if MP.crossfadeOn and not MP.isCrossfading and not MP.abRepeatOn
+               and dur > 0 and (dur - cur) <= (MP.crossfadeSec * 1000) and (dur - cur) > 300 then
+                startCrossfade()
+            end
+        end
+    else
+        -- Watchdog: agar humne pause kiya hua tha lekin audio hardware ne (kisi bhi wajah se,
+        -- jaise Equalizer/Echo attach hone se) khud track resume kar diya, to har second yahan
+        -- check ho ke turant wapas pause ho jayega
+        MP.reassertPauseState()
+    end
+    seekProgress.postDelayed(progressLoop, 1000)
+end
+seekProgress.postDelayed(progressLoop, 1000)
+
+seekProgress.setOnSeekBarChangeListener(luajava.createProxy(
+    "android.widget.SeekBar$OnSeekBarChangeListener",
+    {
+        onProgressChanged = function(bar, progress, fromUser) end,
+        onStartTrackingTouch = function(bar) end,
+        onStopTrackingTouch = function(bar) MP.seekTo(bar.getProgress()) end,
+    }
+))
+
+seekVolume.setOnSeekBarChangeListener(luajava.createProxy(
+    "android.widget.SeekBar$OnSeekBarChangeListener",
+    {
+        onProgressChanged = function(bar, progress, fromUser)
+            if fromUser then MP.setVolume(progress / 100) end
+        end,
+        onStartTrackingTouch = function(bar) end,
+        onStopTrackingTouch = function(bar) end,
+    }
+))
+seekVolume.setProgress(math.floor(MP.volume * 100))
+
+-- ===== Search Bar =====
+-- NOTE: Pehle har letter type karne par buttons dynamically add/remove hote thay (TextWatcher se),
+-- jo TalkBack ke accessibility node-tree ko confuse kar deta tha — isi wajah se neeche ke buttons
+-- (jaise Settings) ka click kabhi-kabhi purane search-result button (jo song play karta hai) par
+-- chala jata tha. Ab search ek dedicated "Search" button dabane par GridView dialog dikhata hai —
+-- yehi reliable pattern Song List aur Playlists mein pehle se kaam kar raha hai.
+-- Voice-to-text se query ke aage/peeche extra space aa jati hai, aur lambe titles mein "|" jaisi
+-- punctuation exact match ko tod deti hai — is liye ab query aur title dono normalize (punctuation
+-- hata ke, extra spaces theek karke) hote hain, aur agar poora text match na ho to bhi kam se kam
+-- aadhe se zyada alfaz (words) mil jayein to gaana result mein aa jayega
+local function normalizeText(s)
+    s = s:lower()
+    s = s:gsub("[^%w%s]", " ")
+    s = s:gsub("%s+", " ")
+    return trimStrGlobal(s)
+end
+
+btnSearchGo.onClick = function()
+    local rawQuery = trimStrGlobal(txtSearch.getText().toString())
+    if rawQuery == "" then
+        service.speak("Pehle kuch search term likhein")
+        return
+    end
+    if #MP.allSongs == 0 then
+        service.speak("Pehle scan karein")
+        return
+    end
+
+    service.speak("Search ho raha hai")
+
+    runInBackground(function()
+        local query = normalizeText(rawQuery)
+        local queryWords = {}
+        for w in query:gmatch("%S+") do
+            if #w >= 2 then table.insert(queryWords, w) end
+        end
+
+        local matchTitles = {}
+        local matchIndices = {}
+        for i, s in ipairs(MP.allSongs) do
+            if s.title then
+                local normTitle = normalizeText(s.title)
+                local matched = false
+                if query ~= "" and normTitle:find(query, 1, true) then
+                    matched = true
+                elseif #queryWords > 0 then
+                    local hitCount = 0
+                    for _, w in ipairs(queryWords) do
+                        if normTitle:find(w, 1, true) then hitCount = hitCount + 1 end
+                    end
+                    if hitCount >= math.max(1, math.ceil(#queryWords / 2)) then
+                        matched = true
+                    end
+                end
+                if matched then
+                    table.insert(matchTitles, s.title)
+                    table.insert(matchIndices, i)
+                end
+            end
+        end
+
+        runOnUiThread(function()
+            -- Keyboard hide karein taake dialog saaf nazar aaye
+            local imm = this.getSystemService("input_method")
+            pcall(function() imm.hideSoftInputFromWindow(txtSearch.getWindowToken(), 0) end)
+
+            if #matchTitles == 0 then
+                service.speak("Koi gaana nahi mila")
+                return
+            end
+
+            local gl = { GridView, id = "gridSearch", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local dlg = LuaDialog(this)
+            dlg.View = loadlayout(gl)
+            gridSearch.adapter = SingleLineAdapter(service, String(matchTitles))
+            dlg.setTitle(#matchTitles .. " gaane mile")
+            dlg.setButton("Cancel", nil)
+            dlg.show()
+            gridSearch.onItemClick = function(l, v)
+                dlg.dismiss()
+                for k, title in ipairs(matchTitles) do
+                    if title == v.text then
+                        MP.songs = MP.allSongs
+                        MP.playIndex(matchIndices[k])
+                        updateSongLabel()
+                        updatePlayPauseLabel()
+                        break
+                    end
+                end
+                txtSearch.setText("")
+            end
+        end)
+    end)
+end
+
+btnSearchClear.onClick = function()
+    txtSearch.setText("")
+    local imm = this.getSystemService("input_method")
+    pcall(function() imm.hideSoftInputFromWindow(txtSearch.getWindowToken(), 0) end)
+end
+
+-- ===== Transport Controls =====
+btnPlayPause.onClick = function()
+    MP.togglePlayPause()
+    updatePlayPauseLabel()
+end
+
+btnNext.onClick = function()
+    MP.next()
+    updateSongLabel()
+    updatePlayPauseLabel()
+end
+
+btnPrev.onClick = function()
+    MP.prev()
+    updateSongLabel()
+    updatePlayPauseLabel()
+end
+
+btnRewind.onClick = function()
+    if MP.player ~= nil then
+        MP.seekTo(math.max(0, MP.player.getCurrentPosition() - MP.skipMs))
+    end
+end
+
+btnForward.onClick = function()
+    if MP.player ~= nil then
+        MP.seekTo(math.min(MP.player.getDuration(), MP.player.getCurrentPosition() + MP.skipMs))
+    end
+end
+
+btnScan.onClick = function()
+    service.speak("Scan ho raha hai, thoda intezar karein")
+    runInBackground(function()
+        local count = MP.scanMusic()
+        runOnUiThread(function()
+            service.speak(count .. " gaane mil gaye")
+        end)
+    end)
+end
+
+-- ===== Latest (Online Streaming) =====
+-- User ne diya hua reference code isi tarah adapt kiya gaya hai: attribution text hata diya,
+-- "AI Search" button ki jagah "Back" rakha (AI feature filhal hidden/chhupa hua rahega),
+-- aur Toast ki jagah service.speak() use kiya hai (screen-reader ke liye zaroori, kyun ke
+-- Toast blind users ko nazar nahi aata)
+function MP.showStreamPlayerControls(mp, onClosed)
+    local pLayout = { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "16dp", layout_width = "fill", layout_height = "wrap",
+        { TextView, text = "Now Playing (Online Stream)", gravity = "center", textSize = "16sp", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "streamPlayPause", text = "Pause", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "streamForward", text = "Forward 10 Seconds", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "streamRewind", text = "Rewind 10 Seconds", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "streamStop", text = "Stop Player", layout_width = "fill", layout_height = "wrap" },
+    }
+    local pDlg = LuaDialog(this)
+    pDlg.setTitle("Player Controls")
+    pDlg.View = loadlayout(pLayout)
+    pDlg.show()
+
+    streamPlayPause.onClick = function()
+        pcall(function()
+            if mp.isPlaying() then
+                mp.pause()
+                streamPlayPause.setText("Play")
+            else
+                mp.start()
+                streamPlayPause.setText("Pause")
+            end
+        end)
+    end
+
+    streamForward.onClick = function()
+        pcall(function()
+            local pos = mp.getCurrentPosition()
+            mp.seekTo(pos + 10000)
+        end)
+    end
+
+    streamRewind.onClick = function()
+        pcall(function()
+            local pos = mp.getCurrentPosition()
+            mp.seekTo(math.max(0, pos - 10000))
+        end)
+    end
+
+    streamStop.onClick = function()
+        pcall(function()
+            mp.stop()
+            mp.release()
+        end)
+        pDlg.dismiss()
+        if onClosed then onClosed() end
+    end
+end
+
+btnLatest.onClick = function()
+    local streamUrl = ""
+    local streamPlayer = nil
+
+    local lLayout = { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "16dp", layout_width = "fill", layout_height = "wrap",
+        { TextView, text = "Online Media Player", textSize = "18sp", gravity = "center", layout_width = "fill", layout_height = "wrap" },
+        { EditText, id = "urlBox", hint = "Paste Direct Streaming URL (mp3 / radio)", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "searchBtn", text = "Paste URL & Search", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "playBtn", text = "Play", visibility = "gone", layout_width = "fill", layout_height = "wrap" },
+        { Button, id = "backBtn", text = "Back", layout_width = "fill", layout_height = "wrap" },
+    }
+
+    local dlg = LuaDialog(this)
+    dlg.setTitle("Online Media Player")
+    dlg.View = loadlayout(lLayout)
+    dlg.show()
+
+    backBtn.onClick = function()
+        if streamPlayer ~= nil then
+            pcall(function() streamPlayer.stop() end)
+            pcall(function() streamPlayer.release() end)
+            streamPlayer = nil
+        end
+        dlg.dismiss()
+    end
+
+    searchBtn.onClick = function()
+        local url = trimStrGlobal(urlBox.getText().toString())
+        if url == "" then
+            service.speak("Pehle URL paste karein")
+            return
+        end
+        streamUrl = url
+        pcall(function() playBtn.setVisibility(0) end)
+        service.speak("URL taiyar hai, ab Play dabayein")
+    end
+
+    playBtn.onClick = function()
+        if streamUrl == "" then return end
+        if streamPlayer ~= nil then
+            pcall(function() streamPlayer.stop() end)
+            pcall(function() streamPlayer.release() end)
+            streamPlayer = nil
+        end
+        service.speak("Buffering ho raha hai")
+        local ok = pcall(function()
+            streamPlayer = MediaPlayer()
+            streamPlayer.setDataSource(streamUrl)
+            streamPlayer.setOnPreparedListener(luajava.createProxy(
+                "android.media.MediaPlayer$OnPreparedListener",
+                { onPrepared = function(mp)
+                    mp.start()
+                    MP.showStreamPlayerControls(mp, function() streamPlayer = nil end)
+                end }
+            ))
+            streamPlayer.setOnErrorListener(luajava.createProxy(
+                "android.media.MediaPlayer$OnErrorListener",
+                { onError = function(mp, what, extra)
+                    service.speak("Stream play nahi ho saka, URL check karein")
+                    return true
+                end }
+            ))
+            streamPlayer.prepareAsync()
+        end)
+        if not ok then
+            service.speak("Stream shuru karne mein masla hua")
+        end
+    end
+end
+
+-- ===== Video Player (Audio se bilkul alag — apne controls, apni settings) =====
+btnVideoPlayer.onClick = function()
+    -- Audio gaana chal raha ho to pause kar dein taake dono awazain mix na ho
+    if MP.player ~= nil and MP.isPlaying then
+        pcall(function() MP.player.pause() end)
+        MP.isPlaying = false
+        updatePlayPauseLabel()
+    end
+
+    -- NOTE: VideoView ko ScrollView ke andar nahi rakha (SurfaceView-based video ScrollView
+    -- ke andar theek se render nahi hota — kaali screen ka masla aata hai). VideoView upar
+    -- fixed rehta hai, neeche ke saare controls ek alag ScrollView mein hain.
+    local vLayout = { LinearLayout, orientation = LinearLayout.VERTICAL, layout_width = "fill", layout_height = "fill",
+        { TextView, id = "txtVTitle", text = "Video Player", textSize = "18sp", gravity = "center", padding = "8dp", layout_width = "fill", layout_height = "wrap" },
+        { SurfaceView, id = "videoSurface", layout_width = "fill", layout_height = "200dp" },
+        { ScrollView, layout_width = "fill", layout_height = "fill",
+            { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "12dp", layout_width = "fill", layout_height = "wrap",
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+                    { EditText, id = "txtVSearch", hint = "Search video...", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                    { Button, id = "btnVSearchGo", text = "Search", layout_width = "wrap", layout_height = "wrap" },
+                    { Button, id = "btnVSearchClear", text = "Clear", layout_width = "wrap", layout_height = "wrap" },
+                },
+                { TextView, id = "txtVName", text = "No video playing", textSize = "14sp", gravity = "center", singleLine = true, ellipsize = "end", layout_width = "fill", layout_height = "wrap" },
+                { TextView, id = "txtVSubtitle", text = "", textSize = "13sp", gravity = "center", singleLine = true, ellipsize = "end", layout_width = "fill", layout_height = "wrap" },
+                { TextView, id = "txtVTime", text = "0:00 / 0:00", gravity = "center", layout_width = "fill", layout_height = "wrap" },
+                { SeekBar, id = "seekVProgress", layout_width = "fill", layout_height = "wrap" },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+                    { Button, id = "btnVPrev", text = "Previous" },
+                    { Button, id = "btnVRewind", text = "Rewind" },
+                },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+                    { Button, id = "btnVPlayPause", text = "Play" },
+                },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap", gravity = "center",
+                    { Button, id = "btnVForward", text = "Forward" },
+                    { Button, id = "btnVNext", text = "Next" },
+                },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+                    { Button, id = "btnVSetA", text = "A-B Repeat: Loop Start", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                    { Button, id = "btnVSetB", text = "A-B Repeat: Loop End", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                    { Button, id = "btnVClearAB", text = "A-B Repeat: Clear", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+                    { Button, id = "btnVVoicePitchDown", text = "Voice Pitch -", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                    { Button, id = "btnVVoicePitch", text = "Voice Pitch +", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                },
+                { Button, id = "btnVDegreeSpeech", text = "Degree Speech", layout_width = "fill", layout_height = "wrap" },
+                { Button, id = "btnVFavToggle", text = "Favorite Karein", layout_width = "fill", layout_height = "wrap" },
+                { LinearLayout, orientation = LinearLayout.HORIZONTAL, layout_width = "fill", layout_height = "wrap",
+                    { Button, id = "btnVList", text = "Video List", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                    { Button, id = "btnVScan", text = "Scan Videos", layout_width = 0, layout_weight = 1, layout_height = "wrap" },
+                },
+                { Button, id = "btnVAudioTrack", text = "Audio Track Badlein", layout_width = "fill", layout_height = "wrap" },
+                { Button, id = "btnVLibrary", text = "Library (Favorites / Recent / Folders)", layout_width = "fill", layout_height = "wrap" },
+                { Button, id = "btnVPlaylist", text = "Video Playlists", layout_width = "fill", layout_height = "wrap" },
+                { Button, id = "btnVSettings", text = "Video Settings", layout_width = "fill", layout_height = "wrap" },
+            }
+        }
+    }
+
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(vLayout)
+    dlg.setTitle("Video Player")
+
+    -- ===== Video engine: seedha MediaPlayer + SurfaceView =====
+    -- NOTE: android.widget.VideoView apna asal MediaPlayer kabhi expose nahi karta, is liye
+    -- speed control jaisi cheezein reflection ke bina reliably kaam nahi karti thin. Ab hum
+    -- seedha MediaPlayer use kar rahe hain (bilkul Audio Player jaisa), jo pakka aur direct hai.
+    local vMediaPlayer = nil
+    local surfaceReady = false
+    local pendingPlayIndex = nil
+    local playVIndex
+
+    local function releaseVPlayer()
+        if vMediaPlayer ~= nil then
+            pcall(function() vMediaPlayer.stop() end)
+            pcall(function() vMediaPlayer.release() end)
+            vMediaPlayer = nil
+            VP.currentPlayerRef = nil
+        end
+    end
+
+    dlg.setButton("Band Karein", function()
+        if vMediaPlayer ~= nil then
+            pcall(function()
+                if vMediaPlayer.isPlaying() then
+                    local vid = VP.videos[VP.currentIndex]
+                    if vid then
+                        VP.resumePositions[vid.path] = vMediaPlayer.getCurrentPosition()
+                        VP.saveResume()
+                    end
+                end
+            end)
+        end
+        releaseVPlayer()
+        VP.isPlaying = false
+    end)
+    dlg.show()
+
+    local videoSurfaceHolder = videoSurface.getHolder()
+    videoSurfaceHolder.addCallback(luajava.createProxy(
+        "android.view.SurfaceHolder$Callback",
+        {
+            surfaceCreated = function(holder)
+                surfaceReady = true
+                if pendingPlayIndex ~= nil then
+                    local idx = pendingPlayIndex
+                    pendingPlayIndex = nil
+                    playVIndex(idx)
+                end
+            end,
+            surfaceChanged = function(holder, format, width, height) end,
+            surfaceDestroyed = function(holder)
+                surfaceReady = false
+            end,
+        }
+    ))
+
+    local function updateVName()
+        if VP.currentIndex >= 1 and VP.currentIndex <= #VP.videos then
+            txtVName.setText(VP.videos[VP.currentIndex].title or "Unknown")
+        else
+            txtVName.setText("No video playing")
+        end
+    end
+
+    local function updateVFavLabel()
+        if VP.currentIndex >= 1 and VP.currentIndex <= #VP.videos then
+            local vid = VP.videos[VP.currentIndex]
+            if VP.isFavorite(vid.path) then
+                btnVFavToggle.setText("Favorite Hai (Nikalein)")
+            else
+                btnVFavToggle.setText("Favorite Karein")
+            end
+        else
+            btnVFavToggle.setText("Favorite Karein")
+        end
+    end
+
+    local function updateVPlayPauseLabel()
+        btnVPlayPause.setText(VP.isPlaying and "Pause" or "Play")
+    end
+
+    local vResumeSaveCounter = 0
+
+    -- Kuch devices par PlaybackParams set karne se paused video khud resume ho sakta hai
+    -- (audio player mein bhi yehi masla mila tha) — is liye yahan bhi wapas pause karne ka guard hai
+    local function reassertVPauseState()
+        if not VP.isPlaying and vMediaPlayer ~= nil then
+            pcall(function()
+                if vMediaPlayer.isPlaying() then vMediaPlayer.pause() end
+            end)
+        end
+    end
+
+    -- Ab seedha MediaPlayer par PlaybackParams lagate hain — koi reflection nahi, is liye
+    -- ye bilkul waisa hi reliable hai jaisa Audio Player ki speed control (jo pehle se kaam
+    -- kar rahi hai). Sirf bohot purane Android versions (API 23 se pehle) par speed change
+    -- support nahi hota, wahan bhi crash nahi hoga, bas speed change nahi hogi.
+    local function applyVideoSpeed()
+        if vMediaPlayer == nil then return end
+        if math.abs(VP.speed - 1.0) < 0.01 then return end
+        local ok = pcall(function()
+            local params = vMediaPlayer.getPlaybackParams()
+            params.setSpeed(VP.speed)
+            vMediaPlayer.setPlaybackParams(params)
+        end)
+        if not ok then
+            service.speak("Speed change is Android version par support nahi")
+        end
+        reassertVPauseState()
+    end
+
+    playVIndex = function(idx)
+        if #VP.videos == 0 then
+            service.speak("Koi video nahi mila, pehle scan karein")
+            return
+        end
+        if not surfaceReady then
+            pendingPlayIndex = idx
+            return
+        end
+        if idx < 1 then idx = #VP.videos end
+        if idx > #VP.videos then idx = 1 end
+        VP.currentIndex = idx
+        local vid = VP.videos[idx]
+
+        releaseVPlayer()
+        pcall(function()
+            vMediaPlayer = MediaPlayer()
+            vMediaPlayer.reset()
+            vMediaPlayer.setDisplay(videoSurfaceHolder)
+            vMediaPlayer.setDataSource(vid.path)
+            VP.currentPlayerRef = vMediaPlayer
+            vMediaPlayer.setOnPreparedListener(luajava.createProxy(
+                "android.media.MediaPlayer$OnPreparedListener",
+                { onPrepared = function(mp)
+                    local resumeMs = VP.resumePositions[vid.path]
+                    if resumeMs and resumeMs > 3000 then
+                        local ok, dur = pcall(function() return vMediaPlayer.getDuration() end)
+                        if ok and dur and dur > 0 and resumeMs < dur - 5000 then
+                            pcall(function() vMediaPlayer.seekTo(resumeMs) end)
+                            service.speak("Pichli position se shuru")
+                        end
+                    end
+                    pcall(function() vMediaPlayer.start() end)
+                    VP.isPlaying = true
+                    applyVideoSpeed()
+                    updateVPlayPauseLabel()
+                end }
+            ))
+            vMediaPlayer.setOnCompletionListener(luajava.createProxy(
+                "android.media.MediaPlayer$OnCompletionListener",
+                { onCompletion = function(mp)
+                    VP.resumePositions[vid.path] = nil
+                    VP.saveResume()
+                    if VP.repeatMode == "one" then
+                        playVIndex(VP.currentIndex)
+                    elseif VP.repeatMode == "all" then
+                        playVIndex(VP.currentIndex + 1)
+                    else
+                        if VP.currentIndex < #VP.videos then
+                            playVIndex(VP.currentIndex + 1)
+                        else
+                            VP.isPlaying = false
+                            updateVPlayPauseLabel()
+                            service.speak("Video list khatam ho gayi")
+                        end
+                    end
+                end }
+            ))
+            vMediaPlayer.prepareAsync()
+        end)
+
+        updateVName()
+        updateVFavLabel()
+        VP.parseSrtForVideo(vid.path)
+        VP.addRecent(vid.path)
+        VP.abPointA = nil
+        VP.abPointB = nil
+        VP.abRepeatOn = false
+        service.speak((vid.title or "Unknown") .. " video shuru ho raha hai")
+    end
+
+    local function vProgressLoop()
+        local hasFocusOk, hasFocus = pcall(function() return activity.hasWindowFocus() end)
+        if hasFocusOk and not hasFocus and VP.isPlaying and vMediaPlayer ~= nil then
+            pcall(function() vMediaPlayer.pause() end)
+            VP.isPlaying = false
+            pcall(updateVPlayPauseLabel)
+        end
+
+        if VP.isPlaying and vMediaPlayer ~= nil then
+            local ok1, cur = pcall(function() return vMediaPlayer.getCurrentPosition() end)
+            local ok2, dur = pcall(function() return vMediaPlayer.getDuration() end)
+            if ok1 and ok2 and dur and dur > 0 then
+                seekVProgress.setMax(dur)
+                seekVProgress.setProgress(cur)
+                txtVTime.setText(MP.formatTime(cur) .. " / " .. MP.formatTime(dur))
+                local subLine = VP.getCurrentSubtitleLine(cur)
+                txtVSubtitle.setText(subLine or "")
+
+                local vid = VP.videos[VP.currentIndex]
+                if vid then
+                    VP.resumePositions[vid.path] = cur
+                    vResumeSaveCounter = vResumeSaveCounter + 1
+                    if vResumeSaveCounter >= 10 then
+                        vResumeSaveCounter = 0
+                        VP.saveResume()
+                    end
+                end
+
+                if VP.abRepeatOn and VP.abPointA and VP.abPointB and cur >= VP.abPointB then
+                    pcall(function() vMediaPlayer.seekTo(VP.abPointA) end)
+                end
+            end
+        else
+            reassertVPauseState()
+        end
+        seekVProgress.postDelayed(vProgressLoop, 1000)
+    end
+    seekVProgress.postDelayed(vProgressLoop, 1000)
+
+    seekVProgress.setOnSeekBarChangeListener(luajava.createProxy(
+        "android.widget.SeekBar$OnSeekBarChangeListener",
+        {
+            onProgressChanged = function(bar, progress, fromUser) end,
+            onStartTrackingTouch = function(bar) end,
+            onStopTrackingTouch = function(bar)
+                if vMediaPlayer ~= nil then pcall(function() vMediaPlayer.seekTo(bar.getProgress()) end) end
+            end,
+        }
+    ))
+
+    btnVPlayPause.onClick = function()
+        if VP.currentIndex < 1 then
+            if #VP.videos > 0 then playVIndex(1) end
+            return
+        end
+        if vMediaPlayer == nil then return end
+        if VP.isPlaying then
+            pcall(function() vMediaPlayer.pause() end)
+            VP.isPlaying = false
+            local vid = VP.videos[VP.currentIndex]
+            if vid then
+                pcall(function() VP.resumePositions[vid.path] = vMediaPlayer.getCurrentPosition() end)
+                VP.saveResume()
+            end
+        else
+            pcall(function() vMediaPlayer.start() end)
+            VP.isPlaying = true
+        end
+        updateVPlayPauseLabel()
+    end
+
+    btnVSetA.onClick = function()
+        if vMediaPlayer == nil then service.speak("Pehle video play karein"); return end
+        local ok, pos = pcall(function() return vMediaPlayer.getCurrentPosition() end)
+        if ok then
+            VP.abPointA = pos
+            VP.abPointB = nil
+            VP.abRepeatOn = false
+            service.speak("Point A set ho gaya")
+        end
+    end
+
+    btnVSetB.onClick = function()
+        if vMediaPlayer == nil then service.speak("Pehle video play karein"); return end
+        if VP.abPointA == nil then service.speak("Pehle Point A set karein"); return end
+        local ok, pos = pcall(function() return vMediaPlayer.getCurrentPosition() end)
+        if ok then
+            if pos <= VP.abPointA then
+                service.speak("Point B, Point A ke baad hona chahiye")
+                return
+            end
+            VP.abPointB = pos
+            VP.abRepeatOn = true
+            service.speak("Point B set ho gaya, A-B Repeat shuru ho gaya")
+        end
+    end
+
+    btnVClearAB.onClick = function()
+        VP.abPointA = nil
+        VP.abPointB = nil
+        VP.abRepeatOn = false
+        service.speak("A-B Repeat clear ho gaya")
+    end
+
+    btnVVoicePitch.onClick = function()
+        MP.cycleVoicePitch()
+    end
+
+    btnVVoicePitchDown.onClick = function()
+        MP.cycleVoicePitchDown()
+    end
+
+    btnVDegreeSpeech.onClick = function()
+        MP.cycleDegreeSpeech()
+    end
+
+    -- ===== Multiple Audio Track / Language =====
+    -- NOTE: Zyada tar phone se record ki hui videos mein sirf ek hi audio track hoti hai —
+    -- ye feature un videos ke liye hai jin mein multiple language/audio tracks embedded hon
+    -- (jaise kuch MKV files). Device/format ke hisaab se kaam na bhi kar sakta hai.
+    btnVAudioTrack.onClick = function()
+        if vMediaPlayer == nil then service.speak("Pehle video play karein"); return end
+        local ok, tracks = pcall(function() return vMediaPlayer.getTrackInfo() end)
+        if not ok or tracks == nil then
+            service.speak("Is video ke tracks nahi mil sake")
+            return
+        end
+        local trackIndices = {}
+        local trackLabels = {}
+        local okLen, len = pcall(function() return tracks.length end)
+        if okLen and len then
+            for i = 0, len - 1 do
+                local okT, t = pcall(function() return tracks[i] end)
+                if okT and t ~= nil then
+                    local okType, ttype = pcall(function() return t.getTrackType() end)
+                    if okType and ttype == 2 then
+                        local okLang, lang = pcall(function() return t.getLanguage() end)
+                        table.insert(trackIndices, i)
+                        table.insert(trackLabels, "Audio Track " .. #trackIndices .. ((okLang and lang and lang ~= "und") and (" (" .. tostring(lang) .. ")") or ""))
+                    end
+                end
+            end
+        end
+        if #trackIndices <= 1 then
+            service.speak("Is video mein sirf ek hi audio track hai")
+            return
+        end
+        local gl = { GridView, id = "gridVTrack", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+        local d2 = LuaDialog(this)
+        d2.View = loadlayout(gl)
+        gridVTrack.adapter = SingleLineAdapter(service, String(trackLabels))
+        d2.setTitle("Audio Track Chunein")
+        d2.setButton("Cancel", nil)
+        d2.show()
+        gridVTrack.onItemClick = function(l, v)
+            d2.dismiss()
+            for k, label in ipairs(trackLabels) do
+                if label == v.text then
+                    local ok2 = pcall(function() vMediaPlayer.selectTrack(trackIndices[k]) end)
+                    if ok2 then
+                        service.speak("Audio track badal diya")
+                    else
+                        service.speak("Ye track is device par badalna support nahi hota")
+                    end
+                    break
+                end
+            end
+        end
+    end
+
+    btnVFavToggle.onClick = function()
+        if VP.currentIndex < 1 or VP.currentIndex > #VP.videos then
+            service.speak("Pehle koi video play karein")
+            return
+        end
+        local vid = VP.videos[VP.currentIndex]
+        local nowFav = VP.toggleFavorite(vid.path)
+        updateVFavLabel()
+        if nowFav then
+            service.speak("Favorites mein add ho gaya")
+        else
+            service.speak("Favorites se nikal diya")
+        end
+    end
+
+    btnVNext.onClick = function() playVIndex(VP.currentIndex + 1) end
+    btnVPrev.onClick = function() playVIndex(VP.currentIndex - 1) end
+
+    btnVRewind.onClick = function()
+        if vMediaPlayer == nil then return end
+        pcall(function()
+            vMediaPlayer.seekTo(math.max(0, vMediaPlayer.getCurrentPosition() - VP.skipMs))
+        end)
+    end
+
+    btnVForward.onClick = function()
+        if vMediaPlayer == nil then return end
+        pcall(function()
+            vMediaPlayer.seekTo(math.min(vMediaPlayer.getDuration(), vMediaPlayer.getCurrentPosition() + VP.skipMs))
+        end)
+    end
+
+    btnVScan.onClick = function()
+        service.speak("Videos scan ho rahe hain, thoda intezar karein")
+        runInBackground(function()
+            local count = VP.scanVideos()
+            runOnUiThread(function()
+                service.speak(count .. " videos mil gaye")
+            end)
+        end)
+    end
+
+    btnVList.onClick = function()
+        if #VP.videos == 0 then service.speak("Pehle scan karein"); return end
+        local items = {}
+        for i, v in ipairs(VP.videos) do table.insert(items, v.title or "Unknown") end
+        local gl = { GridView, id = "gridVList", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+        local d2 = LuaDialog(this)
+        d2.View = loadlayout(gl)
+        gridVList.adapter = SingleLineAdapter(service, String(items))
+        d2.setTitle("Video List")
+        d2.setButton("Cancel", nil)
+        d2.show()
+        gridVList.onItemClick = function(l, v)
+            d2.dismiss()
+            for i, vid in ipairs(VP.videos) do
+                if vid.title == v.text then
+                    playVIndex(i)
+                    break
+                end
+            end
+        end
+    end
+
+    -- ===== Video Library (Favorites / Recently Played / Folder Browsing) =====
+    local function showSimpleVideoList(title, videoList, emptyMessage)
+        if #videoList == 0 then
+            service.speak(emptyMessage)
+            return
+        end
+        local titles = {}
+        for _, v in ipairs(videoList) do table.insert(titles, v.title or "Unknown") end
+        local gl = { GridView, id = "gridVLib", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+        local d2 = LuaDialog(this)
+        d2.View = loadlayout(gl)
+        gridVLib.adapter = SingleLineAdapter(service, String(titles))
+        d2.setTitle(title)
+        d2.setButton("Cancel", nil)
+        d2.show()
+        gridVLib.onItemClick = function(l, v)
+            d2.dismiss()
+            for _, vid in ipairs(videoList) do
+                if vid.title == v.text then
+                    VP.videos = VP.allVideos
+                    for m, allV in ipairs(VP.allVideos) do
+                        if allV.path == vid.path then
+                            playVIndex(m)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    btnVLibrary.onClick = function()
+        local options = {"Favorites Dekhein", "Favorites Clear Karein", "Recently Played Dekhein", "Recently Played Clear Karein", "Folder Se Dekhein", "Sab Videos (Poori Library)"}
+        local gl = { GridView, id = "gridVLibMenu", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+        local d2 = LuaDialog(this)
+        d2.View = loadlayout(gl)
+        gridVLibMenu.adapter = SingleLineAdapter(service, String(options))
+        d2.setTitle("Video Library")
+        d2.setButton("Cancel", nil)
+        d2.show()
+        gridVLibMenu.onItemClick = function(l, v)
+            d2.dismiss()
+
+            if v.text == "Favorites Dekhein" then
+                local favVids = {}
+                for _, path in ipairs(VP.favorites) do
+                    for _, vid in ipairs(VP.allVideos) do
+                        if vid.path == path then table.insert(favVids, vid); break end
+                    end
+                end
+                showSimpleVideoList("Favorites", favVids, "Koi favorite video nahi hai")
+
+            elseif v.text == "Favorites Clear Karein" then
+                VP.favorites = {}
+                VP.saveFavorites()
+                updateVFavLabel()
+                service.speak("Sab video favorites clear ho gaye")
+
+            elseif v.text == "Recently Played Dekhein" then
+                local recentVids = {}
+                for _, path in ipairs(VP.recentlyPlayed) do
+                    for _, vid in ipairs(VP.allVideos) do
+                        if vid.path == path then table.insert(recentVids, vid); break end
+                    end
+                end
+                showSimpleVideoList("Recently Played", recentVids, "Abhi tak koi video play nahi hua")
+
+            elseif v.text == "Recently Played Clear Karein" then
+                VP.recentlyPlayed = {}
+                VP.saveRecent()
+                service.speak("Video history clear ho gayi")
+
+            elseif v.text == "Folder Se Dekhein" then
+                if #VP.allVideos == 0 then service.speak("Pehle scan karein"); return end
+                local folderSet = {}
+                local folderList = {}
+                for _, vid in ipairs(VP.allVideos) do
+                    if vid.path then
+                        local dir = vid.path:match("(.+)/[^/]+$")
+                        if dir and not folderSet[dir] then
+                            folderSet[dir] = true
+                            table.insert(folderList, dir)
+                        end
+                    end
+                end
+                table.sort(folderList)
+                local folderNames = {}
+                for _, dir in ipairs(folderList) do
+                    table.insert(folderNames, dir:match("([^/]+)$") or dir)
+                end
+                local gl2 = { GridView, id = "gridVFolders", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl2)
+                gridVFolders.adapter = SingleLineAdapter(service, String(folderNames))
+                d3.setTitle("Folder Chunein")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVFolders.onItemClick = function(l2, v2)
+                    d3.dismiss()
+                    local chosenDir = nil
+                    for k, name in ipairs(folderNames) do
+                        if name == v2.text then chosenDir = folderList[k]; break end
+                    end
+                    if chosenDir then
+                        local filtered = {}
+                        for _, vid in ipairs(VP.allVideos) do
+                            if vid.path and vid.path:match("(.+)/[^/]+$") == chosenDir then
+                                table.insert(filtered, vid)
+                            end
+                        end
+                        if #filtered == 0 then
+                            service.speak("Is folder mein koi video nahi mila")
+                        else
+                            VP.videos = filtered
+                            playVIndex(1)
+                        end
+                    end
+                end
+
+            elseif v.text == "Sab Videos (Poori Library)" then
+                VP.videos = VP.allVideos
+                service.speak("Poori video library wapas active ho gayi")
+            end
+        end
+    end
+
+    -- ===== Video Playlists =====
+    btnVPlaylist.onClick = function()
+        local options = {"Nayi Playlist Banayein", "Current Video Add Karein", "Playlist Chalayein", "Playlist Ke Videos Dekhein / Remove Karein", "Playlist Rename Karein", "Playlist Delete Karein", "Multiple Playlists Delete Karein", "Playlist Export Karein (Text)"}
+        local gl = { GridView, id = "gridVP", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+        local d2 = LuaDialog(this)
+        d2.View = loadlayout(gl)
+        gridVP.adapter = SingleLineAdapter(service, String(options))
+        d2.setTitle("Video Playlists")
+        d2.setButton("Cancel", nil)
+        d2.show()
+        gridVP.onItemClick = function(l, v)
+            d2.dismiss()
+
+            if v.text == "Nayi Playlist Banayein" then
+                local inLayout = { EditText, id = "txtVPName", hint = "Playlist ka naam", layout_width = "fill", layout_height = "wrap" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(inLayout)
+                d3.setTitle("Nayi Video Playlist")
+                d3.setButton("Save", function()
+                    local name = txtVPName.getText().toString()
+                    if name ~= "" and VP.playlists[name] == nil then
+                        VP.playlists[name] = {}
+                        VP.savePlaylists()
+                        service.speak("Playlist ban gayi")
+                    end
+                end)
+                d3.setButton2("Cancel", nil)
+                d3.show()
+
+            elseif v.text == "Current Video Add Karein" then
+                if VP.currentIndex < 1 then service.speak("Pehle koi video play karein"); return end
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Pehle playlist banayein"); return end
+                local gl2 = { GridView, id = "gridVP2", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl2)
+                gridVP2.adapter = SingleLineAdapter(service, String(names))
+                d3.setTitle("Playlist Chunein")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVP2.onItemClick = function(l2, v2)
+                    d3.dismiss()
+                    table.insert(VP.playlists[v2.text], VP.videos[VP.currentIndex].path)
+                    VP.savePlaylists()
+                    service.speak("Video playlist mein add ho gaya")
+                end
+
+            elseif v.text == "Playlist Chalayein" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local gl3 = { GridView, id = "gridVP3", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl3)
+                gridVP3.adapter = SingleLineAdapter(service, String(names))
+                d3.setTitle("Playlist Chunein")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVP3.onItemClick = function(l3, v3)
+                    d3.dismiss()
+                    local paths = VP.playlists[v3.text]
+                    if paths and #paths > 0 then
+                        local newList = {}
+                        for _, p in ipairs(paths) do
+                            table.insert(newList, {title = p:match("([^/]+)$"), duration = 0, path = p})
+                        end
+                        VP.videos = newList
+                        playVIndex(1)
+                    end
+                end
+
+            elseif v.text == "Playlist Ke Videos Dekhein / Remove Karein" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local gl5 = { GridView, id = "gridVP5", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl5)
+                gridVP5.adapter = SingleLineAdapter(service, String(names))
+                d3.setTitle("Playlist Chunein")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVP5.onItemClick = function(l5, v5)
+                    d3.dismiss()
+                    local plName = v5.text
+                    local paths = VP.playlists[plName]
+                    if not paths or #paths == 0 then service.speak("Playlist khali hai"); return end
+                    local videoNames = {}
+                    for _, p in ipairs(paths) do table.insert(videoNames, p:match("([^/]+)$")) end
+                    local gl6 = { GridView, id = "gridVP6", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                    local d4 = LuaDialog(this)
+                    d4.View = loadlayout(gl6)
+                    gridVP6.adapter = SingleLineAdapter(service, String(videoNames))
+                    d4.setTitle(plName .. " (tap karke remove karein)")
+                    d4.setButton("Band Karein", nil)
+                    d4.show()
+                    gridVP6.onItemClick = function(l6, v6)
+                        d4.dismiss()
+                        for i, p in ipairs(paths) do
+                            if p:match("([^/]+)$") == v6.text then
+                                table.remove(paths, i)
+                                break
+                            end
+                        end
+                        VP.savePlaylists()
+                        service.speak("Video playlist se nikal diya")
+                    end
+                end
+
+            elseif v.text == "Playlist Rename Karein" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local gl7 = { GridView, id = "gridVP7", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl7)
+                gridVP7.adapter = SingleLineAdapter(service, String(names))
+                d3.setTitle("Playlist Chunein")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVP7.onItemClick = function(l7, v7)
+                    d3.dismiss()
+                    local oldName = v7.text
+                    local inLayout2 = { EditText, id = "txtVPNewName", hint = "Naya naam", layout_width = "fill", layout_height = "wrap" }
+                    local d4 = LuaDialog(this)
+                    d4.View = loadlayout(inLayout2)
+                    d4.setTitle("Rename Video Playlist")
+                    d4.setButton("Save", function()
+                        local newName = txtVPNewName.getText().toString()
+                        if newName ~= "" and VP.playlists[newName] == nil then
+                            VP.playlists[newName] = VP.playlists[oldName]
+                            VP.playlists[oldName] = nil
+                            VP.savePlaylists()
+                            service.speak("Playlist rename ho gayi")
+                        end
+                    end)
+                    d4.setButton2("Cancel", nil)
+                    d4.show()
+                end
+
+            elseif v.text == "Playlist Delete Karein" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local gl4 = { GridView, id = "gridVP4", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d3 = LuaDialog(this)
+                d3.View = loadlayout(gl4)
+                gridVP4.adapter = SingleLineAdapter(service, String(names))
+                d3.setTitle("Delete Video Playlist")
+                d3.setButton("Cancel", nil)
+                d3.show()
+                gridVP4.onItemClick = function(l4, v4)
+                    d3.dismiss()
+                    VP.playlists[v4.text] = nil
+                    VP.savePlaylists()
+                    service.speak("Video playlist delete ho gayi")
+                end
+
+            elseif v.text == "Multiple Playlists Delete Karein" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local selected = {}
+                local function buildBatchList()
+                    local items = {"Ho Gaya, Delete Karein"}
+                    for _, name in ipairs(names) do
+                        local mark = selected[name] and "[Selected] " or ""
+                        table.insert(items, mark .. name)
+                    end
+                    return items
+                end
+                local gl8 = { GridView, id = "gridVBatchDel", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d9 = LuaDialog(this)
+                d9.View = loadlayout(gl8)
+                gridVBatchDel.adapter = SingleLineAdapter(service, String(buildBatchList()))
+                d9.setTitle("Playlists Chunein (tap se select/unselect)")
+                d9.setButton("Cancel", nil)
+                d9.show()
+                gridVBatchDel.onItemClick = function(l8, v8)
+                    local text = v8.text
+                    if text == "Ho Gaya, Delete Karein" then
+                        d9.dismiss()
+                        local count = 0
+                        for name, isSel in pairs(selected) do
+                            if isSel then
+                                VP.playlists[name] = nil
+                                count = count + 1
+                            end
+                        end
+                        if count > 0 then
+                            VP.savePlaylists()
+                            service.speak(count .. " video playlists delete ho gayi")
+                        else
+                            service.speak("Koi playlist select nahi ki gayi thi")
+                        end
+                    else
+                        local plainName = text:gsub("^%[Selected%] ", "")
+                        selected[plainName] = not selected[plainName]
+                        gridVBatchDel.adapter = SingleLineAdapter(service, String(buildBatchList()))
+                        service.speak(plainName .. (selected[plainName] and " select ho gayi" or " unselect ho gayi"))
+                    end
+                end
+
+            elseif v.text == "Playlist Export Karein (Text)" then
+                local names = {}
+                for name, _ in pairs(VP.playlists) do table.insert(names, name) end
+                if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+                local gl9 = { GridView, id = "gridVExport", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d10 = LuaDialog(this)
+                d10.View = loadlayout(gl9)
+                gridVExport.adapter = SingleLineAdapter(service, String(names))
+                d10.setTitle("Kaunsi Playlist Export Karni Hai")
+                d10.setButton("Cancel", nil)
+                d10.show()
+                gridVExport.onItemClick = function(l9, v9)
+                    d10.dismiss()
+                    local plName = v9.text
+                    local paths = VP.playlists[plName]
+                    if not paths or #paths == 0 then service.speak("Playlist khali hai"); return end
+                    local exportPath = luajava.luadir .. "/" .. plName .. "_video_playlist.txt"
+                    local f = io.open(exportPath, "w")
+                    if f then
+                        f:write(plName .. " - Video Playlist (Advance Media Player)\n\n")
+                        for i, p in ipairs(paths) do
+                            local title = p:match("([^/]+)$")
+                            for _, vid in ipairs(VP.allVideos) do
+                                if vid.path == p then title = vid.title or title; break end
+                            end
+                            f:write(i .. ". " .. title .. "\n")
+                        end
+                        f:close()
+                        local shared = pcall(function() service.shareFile(exportPath) end)
+                        if shared then
+                            service.speak("Playlist export ho gayi, share karne ke liye options khul rahe hain")
+                        else
+                            service.speak("Playlist text file ban gayi: " .. exportPath)
+                        end
+                    else
+                        service.speak("Export karne mein masla hua")
+                    end
+                end
+            end
+        end
+    end
+
+    btnVSearchGo.onClick = function()
+        local rawQuery = trimStrGlobal(txtVSearch.getText().toString())
+        if rawQuery == "" then service.speak("Pehle kuch search term likhein"); return end
+        if #VP.allVideos == 0 then service.speak("Pehle scan karein"); return end
+
+        service.speak("Search ho raha hai")
+
+        runInBackground(function()
+            local query = trimStrGlobal((rawQuery:lower():gsub("[^%w%s]", " "):gsub("%s+", " ")))
+            local matchTitles = {}
+            local matchIndices = {}
+            for i, v in ipairs(VP.allVideos) do
+                if v.title then
+                    local normTitle = trimStrGlobal((v.title:lower():gsub("[^%w%s]", " "):gsub("%s+", " ")))
+                    if normTitle:find(query, 1, true) then
+                        table.insert(matchTitles, v.title)
+                        table.insert(matchIndices, i)
+                    end
+                end
+            end
+
+            runOnUiThread(function()
+                local imm = this.getSystemService("input_method")
+                pcall(function() imm.hideSoftInputFromWindow(txtVSearch.getWindowToken(), 0) end)
+                if #matchTitles == 0 then service.speak("Koi video nahi mila"); return end
+                local gl = { GridView, id = "gridVSearch", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d2 = LuaDialog(this)
+                d2.View = loadlayout(gl)
+                gridVSearch.adapter = SingleLineAdapter(service, String(matchTitles))
+                d2.setTitle(#matchTitles .. " video mile")
+                d2.setButton("Cancel", nil)
+                d2.show()
+                gridVSearch.onItemClick = function(l, v)
+                    d2.dismiss()
+                    VP.videos = VP.allVideos
+                    for k, title in ipairs(matchTitles) do
+                        if title == v.text then
+                            playVIndex(matchIndices[k])
+                            break
+                        end
+                    end
+                    txtVSearch.setText("")
+                end
+            end)
+        end)
+    end
+
+    btnVSearchClear.onClick = function()
+        txtVSearch.setText("")
+        local imm = this.getSystemService("input_method")
+        pcall(function() imm.hideSoftInputFromWindow(txtVSearch.getWindowToken(), 0) end)
+    end
+
+    btnVSettings.onClick = function()
+        local repeatLabels = {"Off", "One", "All"}
+        local skips = {5, 10, 15, 20, 30}
+        local skipLabels = {"5 Second", "10 Second", "15 Second", "20 Second", "30 Second"}
+        local speeds = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
+        local speedLabels = {"0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"}
+
+        local sLayout2 = { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "16dp", layout_width = "fill", layout_height = "wrap",
+            { TextView, text = "Repeat", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerVRepeat", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Rewind / Forward Duration", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerVSkip", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Playback Speed (kuch devices par kaam nahi bhi kar sakta)", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerVSpeed", layout_width = "fill", layout_height = "wrap" },
+        }
+        local d3 = LuaDialog(this)
+        d3.View = loadlayout(sLayout2)
+        d3.setTitle("Video Settings")
+        d3.setButton("Band Karein", nil)
+        d3.show()
+
+        local adVRepeat = ArrayAdapter(this, 0x01090008, String(repeatLabels))
+        adVRepeat.setDropDownViewResource(0x01090009)
+        spinnerVRepeat.setAdapter(adVRepeat)
+        local repeatIndexMap = {off = 0, one = 1, all = 2}
+        spinnerVRepeat.setSelection(repeatIndexMap[VP.repeatMode] or 0)
+
+        local adVSkip = ArrayAdapter(this, 0x01090008, String(skipLabels))
+        adVSkip.setDropDownViewResource(0x01090009)
+        spinnerVSkip.setAdapter(adVSkip)
+        for i, s in ipairs(skips) do
+            if s * 1000 == VP.skipMs then spinnerVSkip.setSelection(i - 1) end
+        end
+
+        local adVSpeed = ArrayAdapter(this, 0x01090008, String(speedLabels))
+        adVSpeed.setDropDownViewResource(0x01090009)
+        spinnerVSpeed.setAdapter(adVSpeed)
+        for i, s in ipairs(speeds) do
+            if math.abs(s - VP.speed) < 0.01 then spinnerVSpeed.setSelection(i - 1) end
+        end
+
+        spinnerVRepeat.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+            onItemSelected = function(parent, view, position, id)
+                local modes = {"off", "one", "all"}
+                VP.repeatMode = modes[position + 1]
+                VP.saveSettings()
+            end,
+            onNothingSelected = function(parent) end
+        }))
+
+        spinnerVSkip.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+            onItemSelected = function(parent, view, position, id)
+                VP.skipMs = skips[position + 1] * 1000
+                VP.saveSettings()
+            end,
+            onNothingSelected = function(parent) end
+        }))
+
+        spinnerVSpeed.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+            onItemSelected = function(parent, view, position, id)
+                VP.speed = speeds[position + 1]
+                VP.saveSettings()
+                applyVideoSpeed()
+            end,
+            onNothingSelected = function(parent) end
+        }))
+    end
+end
+
+btnSetA.onClick = function()
+    if MP.player == nil then service.speak("Pehle gaana play karein"); return end
+    local ok, pos = pcall(function() return MP.player.getCurrentPosition() end)
+    if ok then
+        MP.abPointA = pos
+        MP.abPointB = nil
+        MP.abRepeatOn = false
+        service.speak("Point A set ho gaya")
+    end
+end
+
+btnSetB.onClick = function()
+    if MP.player == nil then service.speak("Pehle gaana play karein"); return end
+    if MP.abPointA == nil then service.speak("Pehle Point A set karein"); return end
+    local ok, pos = pcall(function() return MP.player.getCurrentPosition() end)
+    if ok then
+        if pos <= MP.abPointA then
+            service.speak("Point B, Point A ke baad hona chahiye")
+            return
+        end
+        MP.abPointB = pos
+        MP.abRepeatOn = true
+        service.speak("Point B set ho gaya, A-B Repeat shuru ho gaya")
+    end
+end
+
+btnClearAB.onClick = function()
+    MP.abPointA = nil
+    MP.abPointB = nil
+    MP.abRepeatOn = false
+    service.speak("A-B Repeat clear ho gaya")
+end
+
+btnVoicePitch.onClick = function()
+    MP.cycleVoicePitch()
+end
+
+btnVoicePitchDown.onClick = function()
+    MP.cycleVoicePitchDown()
+end
+
+btnDegreeSpeech.onClick = function()
+    MP.cycleDegreeSpeech()
+end
+
+btnFavToggle.onClick = function()
+    if MP.currentIndex < 1 or MP.currentIndex > #MP.songs then
+        service.speak("Pehle koi gaana play karein")
+        return
+    end
+    local song = MP.songs[MP.currentIndex]
+    local nowFav = MP.toggleFavorite(song.path)
+    updateFavToggleLabel()
+    if nowFav then
+        service.speak("Favorites mein add ho gaya")
+    else
+        service.speak("Favorites se nikal diya")
+    end
+end
+
+btnSongList.onClick = function()
+    if #MP.songs == 0 then service.speak("Pehle scan karein"); return end
+    local items = {}
+    for i, s in ipairs(MP.songs) do table.insert(items, s.title or "Unknown") end
+    local gl = { GridView, id = "grid", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(gl)
+    grid.adapter = SingleLineAdapter(service, String(items))
+    dlg.setTitle("Song List")
+    dlg.setButton("Cancel", nil)
+    dlg.show()
+    grid.onItemClick = function(l, v)
+        dlg.dismiss()
+        for i, s in ipairs(MP.songs) do
+            if s.title == v.text then
+                MP.playIndex(i)
+                updateSongLabel()
+                updatePlayPauseLabel()
+                break
+            end
+        end
+    end
+end
+
+-- ===== Playlist =====
+btnPlaylist.onClick = function()
+    local options = {"Nayi Playlist Banayein", "Current Gaana Add Karein", "Playlist Chalayein", "Playlist Ke Gaane Dekhein / Remove Karein", "Playlist Rename Karein", "Playlist Delete Karein", "Multiple Playlists Delete Karein", "Playlist Export Karein (Text)"}
+    local gl = { GridView, id = "gridP", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(gl)
+    gridP.adapter = SingleLineAdapter(service, String(options))
+    dlg.setTitle("Playlists")
+    dlg.setButton("Cancel", nil)
+    dlg.show()
+    gridP.onItemClick = function(l, v)
+        dlg.dismiss()
+
+        if v.text == "Nayi Playlist Banayein" then
+            local inLayout = { EditText, id = "txtName", hint = "Playlist ka naam", layout_width = "fill", layout_height = "wrap" }
+            local d2 = LuaDialog(this)
+            d2.View = loadlayout(inLayout)
+            d2.setTitle("Nayi Playlist")
+            d2.setButton("Save", function()
+                local name = txtName.getText().toString()
+                if name ~= "" and MP.playlists[name] == nil then
+                    MP.playlists[name] = {}
+                    MP.savePlaylists()
+                    service.speak("Playlist ban gayi")
+                end
+            end)
+            d2.setButton2("Cancel", nil)
+            d2.show()
+
+        elseif v.text == "Current Gaana Add Karein" then
+            if MP.currentIndex < 1 then service.speak("Pehle koi gaana chalayein"); return end
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Pehle playlist banayein"); return end
+            local gl2 = { GridView, id = "grid2", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d3 = LuaDialog(this)
+            d3.View = loadlayout(gl2)
+            grid2.adapter = SingleLineAdapter(service, String(names))
+            d3.setTitle("Playlist Chunein")
+            d3.setButton("Cancel", nil)
+            d3.show()
+            grid2.onItemClick = function(l2, v2)
+                d3.dismiss()
+                table.insert(MP.playlists[v2.text], MP.songs[MP.currentIndex].path)
+                MP.savePlaylists()
+                service.speak("Gaana playlist mein add ho gaya")
+            end
+
+        elseif v.text == "Playlist Chalayein" then
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local gl3 = { GridView, id = "grid3", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d4 = LuaDialog(this)
+            d4.View = loadlayout(gl3)
+            grid3.adapter = SingleLineAdapter(service, String(names))
+            d4.setTitle("Playlist Chunein")
+            d4.setButton("Cancel", nil)
+            d4.show()
+            grid3.onItemClick = function(l3, v3)
+                d4.dismiss()
+                local paths = MP.playlists[v3.text]
+                if paths and #paths > 0 then
+                    MP.songs = {}
+                    for _, p in ipairs(paths) do
+                        table.insert(MP.songs, {title = p:match("([^/]+)$"), artist = "Playlist", duration = 0, path = p})
+                    end
+                    MP.playIndex(1)
+                    updateSongLabel()
+                    updatePlayPauseLabel()
+                end
+            end
+
+        elseif v.text == "Playlist Ke Gaane Dekhein / Remove Karein" then
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local gl5 = { GridView, id = "grid5", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d6 = LuaDialog(this)
+            d6.View = loadlayout(gl5)
+            grid5.adapter = SingleLineAdapter(service, String(names))
+            d6.setTitle("Playlist Chunein")
+            d6.setButton("Cancel", nil)
+            d6.show()
+            grid5.onItemClick = function(l5, v5)
+                d6.dismiss()
+                local plName = v5.text
+                local paths = MP.playlists[plName]
+                if not paths or #paths == 0 then service.speak("Playlist khali hai"); return end
+                local songNames = {}
+                for _, p in ipairs(paths) do table.insert(songNames, p:match("([^/]+)$")) end
+                local gl6 = { GridView, id = "grid6", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+                local d7 = LuaDialog(this)
+                d7.View = loadlayout(gl6)
+                grid6.adapter = SingleLineAdapter(service, String(songNames))
+                d7.setTitle(plName .. " (tap karke remove karein)")
+                d7.setButton("Band Karein", nil)
+                d7.show()
+                grid6.onItemClick = function(l6, v6)
+                    d7.dismiss()
+                    for i, p in ipairs(paths) do
+                        if p:match("([^/]+)$") == v6.text then
+                            table.remove(paths, i)
+                            break
+                        end
+                    end
+                    MP.savePlaylists()
+                    service.speak("Gaana playlist se nikal diya")
+                end
+            end
+
+        elseif v.text == "Playlist Rename Karein" then
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local gl7 = { GridView, id = "grid7", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d8 = LuaDialog(this)
+            d8.View = loadlayout(gl7)
+            grid7.adapter = SingleLineAdapter(service, String(names))
+            d8.setTitle("Playlist Chunein")
+            d8.setButton("Cancel", nil)
+            d8.show()
+            grid7.onItemClick = function(l7, v7)
+                d8.dismiss()
+                local oldName = v7.text
+                local inLayout2 = { EditText, id = "txtNewName", hint = "Naya naam", layout_width = "fill", layout_height = "wrap" }
+                local d9 = LuaDialog(this)
+                d9.View = loadlayout(inLayout2)
+                d9.setTitle("Rename Playlist")
+                d9.setButton("Save", function()
+                    local newName = txtNewName.getText().toString()
+                    if newName ~= "" and MP.playlists[newName] == nil then
+                        MP.playlists[newName] = MP.playlists[oldName]
+                        MP.playlists[oldName] = nil
+                        MP.savePlaylists()
+                        service.speak("Playlist rename ho gayi")
+                    end
+                end)
+                d9.setButton2("Cancel", nil)
+                d9.show()
+            end
+
+        elseif v.text == "Playlist Delete Karein" then
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local gl4 = { GridView, id = "grid4", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d5 = LuaDialog(this)
+            d5.View = loadlayout(gl4)
+            grid4.adapter = SingleLineAdapter(service, String(names))
+            d5.setTitle("Delete Playlist")
+            d5.setButton("Cancel", nil)
+            d5.show()
+            grid4.onItemClick = function(l4, v4)
+                d5.dismiss()
+                MP.playlists[v4.text] = nil
+                MP.savePlaylists()
+                service.speak("Playlist delete ho gayi")
+            end
+
+        elseif v.text == "Multiple Playlists Delete Karein" then
+            -- Accessible batch-select: har tap se list mein se ek playlist select/unselect hoti
+            -- hai (screen-reader ke liye visual checkbox se behtar tareeqa), "Ho Gaya, Delete
+            -- Karein" dabane par sab select ki hui ek sath delete ho jati hain
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local selected = {}
+            local function buildBatchList()
+                local items = {"Ho Gaya, Delete Karein"}
+                for _, name in ipairs(names) do
+                    local mark = selected[name] and "[Selected] " or ""
+                    table.insert(items, mark .. name)
+                end
+                return items
+            end
+            local gl8 = { GridView, id = "gridBatchDel", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d9 = LuaDialog(this)
+            d9.View = loadlayout(gl8)
+            gridBatchDel.adapter = SingleLineAdapter(service, String(buildBatchList()))
+            d9.setTitle("Playlists Chunein (tap se select/unselect)")
+            d9.setButton("Cancel", nil)
+            d9.show()
+            gridBatchDel.onItemClick = function(l8, v8)
+                local text = v8.text
+                if text == "Ho Gaya, Delete Karein" then
+                    d9.dismiss()
+                    local count = 0
+                    for name, isSel in pairs(selected) do
+                        if isSel then
+                            MP.playlists[name] = nil
+                            count = count + 1
+                        end
+                    end
+                    if count > 0 then
+                        MP.savePlaylists()
+                        service.speak(count .. " playlists delete ho gayi")
+                    else
+                        service.speak("Koi playlist select nahi ki gayi thi")
+                    end
+                else
+                    local plainName = text:gsub("^%[Selected%] ", "")
+                    selected[plainName] = not selected[plainName]
+                    gridBatchDel.adapter = SingleLineAdapter(service, String(buildBatchList()))
+                    service.speak(plainName .. (selected[plainName] and " select ho gayi" or " unselect ho gayi"))
+                end
+            end
+
+        elseif v.text == "Playlist Export Karein (Text)" then
+            local names = {}
+            for name, _ in pairs(MP.playlists) do table.insert(names, name) end
+            if #names == 0 then service.speak("Koi playlist mojood nahi"); return end
+            local gl9 = { GridView, id = "gridExport", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d10 = LuaDialog(this)
+            d10.View = loadlayout(gl9)
+            gridExport.adapter = SingleLineAdapter(service, String(names))
+            d10.setTitle("Kaunsi Playlist Export Karni Hai")
+            d10.setButton("Cancel", nil)
+            d10.show()
+            gridExport.onItemClick = function(l9, v9)
+                d10.dismiss()
+                local plName = v9.text
+                local paths = MP.playlists[plName]
+                if not paths or #paths == 0 then service.speak("Playlist khali hai"); return end
+                local exportPath = luajava.luadir .. "/" .. plName .. "_playlist.txt"
+                local f = io.open(exportPath, "w")
+                if f then
+                    f:write(plName .. " - Playlist (Advance Media Player)\n\n")
+                    for i, p in ipairs(paths) do
+                        local title = p:match("([^/]+)$")
+                        for _, s in ipairs(MP.allSongs) do
+                            if s.path == p then title = s.title or title; break end
+                        end
+                        f:write(i .. ". " .. title .. "\n")
+                    end
+                    f:close()
+                    local shared = pcall(function() service.shareFile(exportPath) end)
+                    if shared then
+                        service.speak("Playlist export ho gayi, share karne ke liye options khul rahe hain")
+                    else
+                        service.speak("Playlist text file ban gayi: " .. exportPath)
+                    end
+                else
+                    service.speak("Export karne mein masla hua")
+                end
+            end
+        end
+    end
+end
+
+-- ===== Library (Favorites / Recently Played / Folder Browsing) =====
+local function showSimplePlayList(title, songList, emptyMessage)
+    if #songList == 0 then
+        service.speak(emptyMessage)
+        return
+    end
+    local titles = {}
+    for _, s in ipairs(songList) do table.insert(titles, s.title or "Unknown") end
+    local gl = { GridView, id = "gridLib", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(gl)
+    gridLib.adapter = SingleLineAdapter(service, String(titles))
+    dlg.setTitle(title)
+    dlg.setButton("Cancel", nil)
+    dlg.show()
+    gridLib.onItemClick = function(l, v)
+        dlg.dismiss()
+        for k, s in ipairs(songList) do
+            if s.title == v.text then
+                MP.songs = MP.allSongs
+                for m, allS in ipairs(MP.allSongs) do
+                    if allS.path == s.path then
+                        MP.playIndex(m)
+                        updateSongLabel()
+                        updatePlayPauseLabel()
+                        return
+                    end
+                end
+            end
+        end
+    end
+end
+
+btnLibrary.onClick = function()
+    local options = {"Favorites Dekhein", "Favorites Clear Karein", "Recently Played Dekhein", "Recently Played Clear Karein", "Folder Se Sunain", "Sab Gaane (Poori Library)"}
+    local gl = { GridView, id = "gridLibMenu", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(gl)
+    gridLibMenu.adapter = SingleLineAdapter(service, String(options))
+    dlg.setTitle("Library")
+    dlg.setButton("Cancel", nil)
+    dlg.show()
+    gridLibMenu.onItemClick = function(l, v)
+        dlg.dismiss()
+
+        if v.text == "Favorites Dekhein" then
+            local favSongs = {}
+            for _, path in ipairs(MP.favorites) do
+                local found = nil
+                for _, s in ipairs(MP.allSongs) do
+                    if s.path == path then found = s; break end
+                end
+                if found then table.insert(favSongs, found) end
+            end
+            showSimplePlayList("Favorites", favSongs, "Koi favorite gaana nahi hai")
+
+        elseif v.text == "Favorites Clear Karein" then
+            MP.favorites = {}
+            MP.saveFavorites()
+            updateFavToggleLabel()
+            service.speak("Sab favorites clear ho gaye")
+
+        elseif v.text == "Recently Played Dekhein" then
+            local recentSongs = {}
+            for _, path in ipairs(MP.recentlyPlayed) do
+                local found = nil
+                for _, s in ipairs(MP.allSongs) do
+                    if s.path == path then found = s; break end
+                end
+                if found then table.insert(recentSongs, found) end
+            end
+            showSimplePlayList("Recently Played", recentSongs, "Abhi tak koi gaana play nahi hua")
+
+        elseif v.text == "Recently Played Clear Karein" then
+            MP.recentlyPlayed = {}
+            MP.saveRecent()
+            service.speak("Recently Played history clear ho gayi")
+
+        elseif v.text == "Folder Se Sunain" then
+            if #MP.allSongs == 0 then service.speak("Pehle scan karein"); return end
+            local folderSet = {}
+            local folderList = {}
+            for _, s in ipairs(MP.allSongs) do
+                if s.path then
+                    local dir = s.path:match("(.+)/[^/]+$")
+                    if dir and not folderSet[dir] then
+                        folderSet[dir] = true
+                        table.insert(folderList, dir)
+                    end
+                end
+            end
+            table.sort(folderList)
+            local folderNames = {}
+            for _, dir in ipairs(folderList) do
+                table.insert(folderNames, dir:match("([^/]+)$") or dir)
+            end
+            local gl2 = { GridView, id = "gridFolders", numColumns = 1, layout_width = "fill", layout_height = "fill" }
+            local d2 = LuaDialog(this)
+            d2.View = loadlayout(gl2)
+            gridFolders.adapter = SingleLineAdapter(service, String(folderNames))
+            d2.setTitle("Folder Chunein")
+            d2.setButton("Cancel", nil)
+            d2.show()
+            gridFolders.onItemClick = function(l2, v2)
+                d2.dismiss()
+                local chosenDir = nil
+                for k, name in ipairs(folderNames) do
+                    if name == v2.text then chosenDir = folderList[k]; break end
+                end
+                if chosenDir then
+                    local filtered = {}
+                    for _, s in ipairs(MP.allSongs) do
+                        if s.path and s.path:match("(.+)/[^/]+$") == chosenDir then
+                            table.insert(filtered, s)
+                        end
+                    end
+                    if #filtered == 0 then
+                        service.speak("Is folder mein koi gaana nahi mila")
+                    else
+                        MP.songs = filtered
+                        MP.playIndex(1)
+                        updateSongLabel()
+                        updatePlayPauseLabel()
+                    end
+                end
+            end
+
+        elseif v.text == "Sab Gaane (Poori Library)" then
+            MP.songs = MP.allSongs
+            service.speak("Poori library wapas active ho gayi")
+        end
+    end
+end
+
+-- ===== Sleep Timer helper =====
+local function scheduleSleepTimer(minutes)
+    MP.sleepTimerToken = MP.sleepTimerToken + 1
+    local myToken = MP.sleepTimerToken
+    service.speak(minutes .. " minute ke baad music band ho jayegi")
+    seekProgress.postDelayed(function()
+        if myToken == MP.sleepTimerToken and MP.player ~= nil and MP.isPlaying then
+            MP.togglePlayPause()
+            updatePlayPauseLabel()
+            service.speak("Sleep timer khatam, music band")
+        end
+    end, minutes * 60000)
+end
+
+local function cancelSleepTimer()
+    MP.sleepTimerToken = MP.sleepTimerToken + 1
+end
+
+-- ===== Settings Screen (Spinner based) =====
+btnSettings.onClick = function()
+    local speeds = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
+    local speedLabels = {"0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"}
+    local skips = {5, 10, 15, 20, 30}
+    local skipLabels = {"5 Second", "10 Second", "15 Second", "20 Second", "30 Second"}
+    local sleepLabels = {"Off", "15 Minute", "30 Minute", "45 Minute", "60 Minute"}
+    local shuffleLabels = {"Off", "On"}
+    local repeatLabels = {"Off", "One", "All"}
+    local echoLabels = {"None", "Small Room", "Medium Room", "Large Room", "Medium Hall", "Large Hall", "Plate"}
+    local echoValues = {-1, PresetReverb.PRESET_SMALLROOM, PresetReverb.PRESET_MEDIUMROOM, PresetReverb.PRESET_LARGEROOM, PresetReverb.PRESET_MEDIUMHALL, PresetReverb.PRESET_LARGEHALL, PresetReverb.PRESET_PLATE}
+    local bassLabels = {"Off", "On"}
+    local crossfadeLabels = {"Off", "On"}
+    local crossfadeSecs = {3, 5, 8, 12}
+    local crossfadeSecLabels = {"3 Second", "5 Second", "8 Second", "12 Second"}
+    local themeLabels = {"Light", "Dark"}
+    local themeValues = {"light", "dark"}
+
+    -- NOTE: Pehle yahan "Equalizer(0, 0)" bana ke sirf preset names list karte thay — session ID "0"
+    -- Android ka GLOBAL/system audio session hota hai, aur ise chhedna kuch devices (jaise Samsung) par
+    -- OS ko "media resume/play" signal bhej deta hai — LEKIN sirf tab jab pehle se koi MediaSession
+    -- (yaani hamara gaana) maujood ho. Yehi asal wajah thi ke gaana play karne ke baad Settings click
+    -- karne par gaana khud chal jata tha. Ab hum session 0 ko bilkul nahi chhuenge.
+    local eqLabels = {"Off"}
+    if MP.player ~= nil then
+        local ok, tempEq = pcall(function() return Equalizer(0, MP.player.getAudioSessionId()) end)
+        if ok and tempEq ~= nil then
+            local ok2, numPresets = pcall(function() return tempEq.getNumberOfPresets() end)
+            if ok2 and numPresets ~= nil then
+                for i = 0, numPresets - 1 do
+                    local ok3, name = pcall(function() return tempEq.getPresetName(i) end)
+                    if ok3 then table.insert(eqLabels, tostring(name)) end
+                end
+            end
+            pcall(function() tempEq.release() end)
+        end
+    end
+    if #eqLabels == 1 then
+        -- Koi gaana abhi tak play nahi hua (ya presets nahi mil sake) — standard Android preset
+        -- names dikha dein, gaana play hote hi asal device presets khud aa jayenge
+        local fallbackPresets = {"Normal", "Classical", "Dance", "Flat", "Folk", "Heavy Metal", "Hip Hop", "Jazz", "Pop", "Rock"}
+        for _, name in ipairs(fallbackPresets) do table.insert(eqLabels, name) end
+    end
+    MP.reassertPauseState()
+
+    local sLayout = { ScrollView, layout_width = "fill", layout_height = "fill",
+        { LinearLayout, orientation = LinearLayout.VERTICAL, padding = "16dp", layout_width = "fill", layout_height = "wrap",
+            { TextView, text = "Shuffle", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerShuffle", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Repeat", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerRepeat", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Playback Speed", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerSpeed", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Rewind / Forward Duration", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerSkip", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Sleep Timer", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerSleep", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Equalizer", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerEq", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Echo Sound (Hall / Room Effect)", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerEcho", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Bass Boost", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerBass", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Crossfade", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerCrossfade", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Crossfade Duration", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerCrossfadeSec", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Theme", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerTheme", layout_width = "fill", layout_height = "wrap" },
+            { TextView, text = "Speech Ducking (temporary while speaking)", layout_width = "fill", layout_height = "wrap" },
+            { Spinner, id = "spinnerSpeechDucking", layout_width = "fill", layout_height = "wrap" },
+            { Button, id = "btnResetSettings", text = "Settings Reset Karein", layout_width = "fill", layout_height = "wrap" },
+            { Button, id = "btnBackupExport", text = "Backup Banayein", layout_width = "fill", layout_height = "wrap" },
+            { Button, id = "btnBackupImport", text = "Backup Restore Karein", layout_width = "fill", layout_height = "wrap" },
+        }
+    }
+
+    local dlg = LuaDialog(this)
+    dlg.View = loadlayout(sLayout)
+    dlg.setTitle("Settings")
+    dlg.setButton("Band Karein", nil)
+    dlg.show()
+
+    local adShuffle = ArrayAdapter(this, 0x01090008, String(shuffleLabels))
+    adShuffle.setDropDownViewResource(0x01090009)
+    spinnerShuffle.setAdapter(adShuffle)
+    spinnerShuffle.setSelection(MP.shuffle and 1 or 0)
+
+    local adRepeat = ArrayAdapter(this, 0x01090008, String(repeatLabels))
+    adRepeat.setDropDownViewResource(0x01090009)
+    spinnerRepeat.setAdapter(adRepeat)
+    local repeatIndexMap = {off = 0, one = 1, all = 2}
+    spinnerRepeat.setSelection(repeatIndexMap[MP.repeatMode] or 0)
+
+    local adSpeed = ArrayAdapter(this, 0x01090008, String(speedLabels))
+    adSpeed.setDropDownViewResource(0x01090009)
+    spinnerSpeed.setAdapter(adSpeed)
+    for i, s in ipairs(speeds) do
+        if math.abs(s - MP.speed) < 0.01 then spinnerSpeed.setSelection(i - 1) end
+    end
+
+    local adSkip = ArrayAdapter(this, 0x01090008, String(skipLabels))
+    adSkip.setDropDownViewResource(0x01090009)
+    spinnerSkip.setAdapter(adSkip)
+    for i, s in ipairs(skips) do
+        if s * 1000 == MP.skipMs then spinnerSkip.setSelection(i - 1) end
+    end
+
+    local adSleep = ArrayAdapter(this, 0x01090008, String(sleepLabels))
+    adSleep.setDropDownViewResource(0x01090009)
+    spinnerSleep.setAdapter(adSleep)
+
+    local adEq = ArrayAdapter(this, 0x01090008, String(eqLabels))
+    adEq.setDropDownViewResource(0x01090009)
+    spinnerEq.setAdapter(adEq)
+    spinnerEq.setSelection(MP.eqPresetIndex + 2 > #eqLabels and 0 or (MP.eqPresetIndex + 2))
+
+    local adEcho = ArrayAdapter(this, 0x01090008, String(echoLabels))
+    adEcho.setDropDownViewResource(0x01090009)
+    spinnerEcho.setAdapter(adEcho)
+    for i, val in ipairs(echoValues) do
+        if val == MP.echoPreset then spinnerEcho.setSelection(i - 1) end
+    end
+
+    local adBass = ArrayAdapter(this, 0x01090008, String(bassLabels))
+    adBass.setDropDownViewResource(0x01090009)
+    spinnerBass.setAdapter(adBass)
+    spinnerBass.setSelection(MP.bassBoostOn and 1 or 0)
+
+    local adCrossfade = ArrayAdapter(this, 0x01090008, String(crossfadeLabels))
+    adCrossfade.setDropDownViewResource(0x01090009)
+    spinnerCrossfade.setAdapter(adCrossfade)
+    spinnerCrossfade.setSelection(MP.crossfadeOn and 1 or 0)
+
+    local adCrossfadeSec = ArrayAdapter(this, 0x01090008, String(crossfadeSecLabels))
+    adCrossfadeSec.setDropDownViewResource(0x01090009)
+    spinnerCrossfadeSec.setAdapter(adCrossfadeSec)
+    for i, s in ipairs(crossfadeSecs) do
+        if s == MP.crossfadeSec then spinnerCrossfadeSec.setSelection(i - 1) end
+    end
+
+    local adTheme = ArrayAdapter(this, 0x01090008, String(themeLabels))
+    adTheme.setDropDownViewResource(0x01090009)
+    spinnerTheme.setAdapter(adTheme)
+    for i, t in ipairs(themeValues) do
+        if t == MP.theme then spinnerTheme.setSelection(i - 1) end
+    end
+
+    local duckingLabels = {"Off", "On"}
+    local adDucking = ArrayAdapter(this, 0x01090008, String(duckingLabels))
+    adDucking.setDropDownViewResource(0x01090009)
+    spinnerSpeechDucking.setAdapter(adDucking)
+    spinnerSpeechDucking.setSelection(MP.speechDuckingEnabled and 1 or 0)
+
+    spinnerShuffle.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.shuffle = (position == 1)
+            MP.saveSettings()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerRepeat.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            local modes = {"off", "one", "all"}
+            MP.repeatMode = modes[position + 1]
+            MP.saveSettings()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerSpeed.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id) MP.setSpeed(speeds[position + 1]) end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerSkip.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.skipMs = skips[position + 1] * 1000
+            MP.saveSettings()
+            updateSkipLabels()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerSleep.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            if position == 0 then
+                cancelSleepTimer()
+            else
+                local minutesMap = {15, 30, 45, 60}
+                scheduleSleepTimer(minutesMap[position])
+            end
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerEq.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.eqPresetIndex = position - 1
+            MP.saveSettings()
+            if MP.equalizer ~= nil then
+                pcall(function()
+                    if MP.eqPresetIndex >= 0 then
+                        MP.equalizer.setEnabled(true)
+                        MP.equalizer.usePreset(MP.eqPresetIndex)
+                    else
+                        MP.equalizer.setEnabled(false)
+                    end
+                end)
+            end
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerEcho.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.echoPreset = echoValues[position + 1]
+            MP.saveSettings()
+            MP.applySoundEffects()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerBass.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.bassBoostOn = (position == 1)
+            MP.saveSettings()
+            MP.applySoundEffects()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerCrossfade.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.crossfadeOn = (position == 1)
+            MP.saveSettings()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerCrossfadeSec.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.crossfadeSec = crossfadeSecs[position + 1]
+            MP.saveSettings()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerTheme.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.theme = themeValues[position + 1]
+            MP.saveSettings()
+            MP.applyTheme()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    spinnerSpeechDucking.setOnItemSelectedListener(luajava.createProxy("android.widget.AdapterView$OnItemSelectedListener", {
+        onItemSelected = function(parent, view, position, id)
+            MP.speechDuckingEnabled = (position == 1)
+            MP.saveSettings()
+        end,
+        onNothingSelected = function(parent) end
+    }))
+
+    btnResetSettings.onClick = function()
+        MP.repeatMode = "off"
+        MP.shuffle = false
+        MP.volume = 1.0
+        MP.speed = 1.0
+        MP.skipMs = 10000
+        MP.eqPresetIndex = -1
+        MP.echoPreset = -1
+        MP.bassBoostOn = false
+        MP.saveSettings()
+        updateSkipLabels()
+        seekVolume.setProgress(100)
+        spinnerShuffle.setSelection(0)
+        spinnerRepeat.setSelection(0)
+        spinnerSpeed.setSelection(2)
+        spinnerSkip.setSelection(1)
+        spinnerEq.setSelection(0)
+        spinnerEcho.setSelection(0)
+        spinnerBass.setSelection(0)
+        if MP.equalizer ~= nil then pcall(function() MP.equalizer.setEnabled(false) end) end
+        MP.applySoundEffects()
+        service.speak("Settings reset ho gayi")
+    end
+
+    btnBackupExport.onClick = function()
+        local ok = MP.exportBackup()
+        if ok then
+            service.speak("Backup ban gaya: " .. MP.backupPath)
+        else
+            service.speak("Backup banane mein masla hua")
+        end
+    end
+
+    btnBackupImport.onClick = function()
+        local ok = MP.importBackup()
+        if ok then
+            service.speak("Backup restore ho gaya, dialog band kar ke dobara Settings kholein")
+            spinnerShuffle.setSelection(MP.shuffle and 1 or 0)
+        else
+            service.speak("Koi backup file nahi mili")
+        end
+    end
+end
+
+-- ===== User Guide Data =====
+-- Har feature ka naam aur poori description — About & Support ke andar "User Guide" se
+-- Next/Previous kar ke ek ek karke padha ja sakta hai
+MP.userGuideItems = {
+    {title = "Search (Audio)", description = "Gaana search karne ke liye naam likhein aur 'Search' dabayein. Poori tarah sahi spelling na bhi ho to bhi milta-julta naam likhne se gaana mil jayega. 'Clear' button se search box khali ho jata hai."},
+    {title = "Play / Pause / Previous / Next", description = "Bunyadi transport controls — gaana chalayein, roken, pichla ya agla gaana sunein."},
+    {title = "Rewind / Forward", description = "Gaane ko kuch second peeche ya aage le jayein. Kitne second peeche/aage jana hai, ye Settings mein 'Rewind/Forward Duration' se set hota hai."},
+    {title = "Volume", description = "Neeche di gayi slider se gaane ki awaz kam ya zyada karein."},
+    {title = "A-B Repeat: Loop Start / Loop End / Clear", description = "Gaane ka koi khaas hissa baar baar sunna ho (jaise Quran ki tilawat practice karna) to 'Loop Start' dabayein jahan se shuru karna hai, phir 'Loop End' dabayein jahan tak sunna hai — wo hissa baar baar loop hoga. 'Clear' se loop hata dein."},
+    {title = "Voice Pitch", description = "Awaz ki pitch (moti ya patli awaz) 5 alag levels mein cycle karta hai — har tap par agli value par chala jata hai."},
+    {title = "Degree Speech", description = "Gaane/video ki playback speed 5 alag levels mein cycle karta hai — har tap par thodi tez ho jati hai."},
+    {title = "Favorite Karein", description = "Chal raha gaana ek tap se Favorites list mein add ya remove ho jata hai."},
+    {title = "Song List", description = "Device ke saare scan-shuda gaanon ki poori list — kisi bhi gaane par tap kar ke seedha play karein."},
+    {title = "Library — Favorites / Recently Played / Folders", description = "Apni pasandeeda gaanon ki list dekhein, pichle 30 sune hue gaane dekhein, ya ek khaas folder ke gaane chunein. 'Sab Gaane' se poori library wapas active ho jati hai."},
+    {title = "Playlists", description = "Apni playlists banayein, unmein gaane add karein, playlist chalayein, gaane remove karein, playlist ka naam badlein ya delete karein. 'Multiple Playlists Delete' se ek sath kayi playlists delete ho sakti hain, aur 'Export (Text)' se playlist WhatsApp par text file ki tarah share ho sakti hai."},
+    {title = "Scan / Rescan Music", description = "Agar naye gaane device mein add hue hon, to ye button dabane se dobara scan ho ke list update ho jati hai."},
+    {title = "Lyrics", description = "Agar gaane ke sath usi naam ki .lrc file usi folder mein ho, to gaana chalte waqt neeche synced lyrics khud dikhengi."},
+    {title = "Settings — Repeat / Shuffle / Sleep Timer", description = "Repeat mode (Off/One/All), Shuffle on/off, aur Sleep Timer (X minute baad khud pause) yahan set hota hai."},
+    {title = "Settings — Equalizer / Echo / Bass Boost", description = "Awaz ki quality customize karein — Equalizer presets, Echo (hall/room jaisa effect), aur Bass Boost."},
+    {title = "Settings — Crossfade", description = "On karne se ek gaana khatam hone se pehle agla gaana dheere dheere shuru ho jata hai, dono overlap hote hain."},
+    {title = "Settings — Theme", description = "Light ya Dark background/text color chunein."},
+    {title = "Settings — Speech Ducking", description = "On hone par jab bhi app kuch bolta hai, gaane/video ki awaz thodi der ke liye halki ho jati hai taake announcement saaf sunayi de, phir wapas normal ho jati hai."},
+    {title = "Backup / Restore", description = "'Backup Banayein' se aapki saari settings, playlists, favorites, aur history ek file mein save ho jati hai. 'Backup Restore Karein' se wapas load ho jati hai — naya phone lene par kaam aata hai."},
+    {title = "Video Player", description = "Main screen se 'Video Player Kholein' dabayein — ye audio se bilkul alag screen hai, apne khud ke controls aur settings ke sath."},
+    {title = "Video — Search / List / Scan", description = "Audio jaisa hi — video search karein, poori video list dekhein, ya 'Scan Videos' se naye videos dhoondein."},
+    {title = "Video — Favorites / Recently Played / Folders", description = "Audio Library jaisa hi — pasandeeda videos, pichle dekhe hue videos, ya folder-wise browsing."},
+    {title = "Video — Playlists", description = "Apni video playlists banayein aur manage karein — bilkul audio playlists jaisa."},
+    {title = "Video — Resume Playback", description = "Video beech mein chhod dein to agli baar wahi video khud usi jagah se shuru hogi jahan chhoda tha."},
+    {title = "Video — Subtitles", description = "Agar video ke sath usi naam ki .srt file ho, to video chalte waqt neeche synced subtitles khud dikhengi."},
+    {title = "Video — Audio Track Badlein", description = "Agar video mein ek se zyada audio track/language embedded ho (jaise kuch MKV files), to yahan se track badal sakte hain. Zyada tar phone-recorded videos mein sirf ek hi track hoti hai."},
+    {title = "Video — A-B Repeat / Voice Pitch / Degree Speech", description = "Audio jaisi hi features — kisi hissay ko loop karna, pitch aur speed cycle karna — video ke liye bhi alag se maujood hain."},
+    {title = "Now Playing Notification", description = "Gaana chalte waqt notification bar mein uska naam dikhta hai. NOTE: Is par functional Play/Pause/Next buttons nahi hain (Android ki platform limitation ki wajah se), sirf info dikhti hai."},
+    {title = "Online Media Player", description = "Kisi bhi direct streaming URL (jaise mp3 link ya online radio) ko paste karke seedha internet se sun sakte hain — device mein download kiye bagair. URL paste karein, 'Paste URL & Search' dabayein, phir 'Play' se stream shuru karein. Player controls mein Play/Pause, Forward/Rewind 10 second, aur Stop maujood hain."},
+}
+
+-- ===== About & Support =====
+function MP.showAboutSupport()
+    local dlg = LuaDialog(this)
+    dlg.setTitle("About & Support")
+    dlg.setMessage("Advance Media Player — Version 1.0\n\nEk mukammal offline Audio aur Video player, khaas taur par accessibility (screen-reader) users ke liye banaya gaya hai.\n\nDeveloped by: BF Tech Welfare\nProject by: Noman Khan\n\nCommunity Group: https://chat.whatsapp.com/IVBt3R3GjPX7NlPG1iBFeg")
+    dlg.setButton("User Guide", function()
+        MP.showGuidePage(1)
+    end)
+    dlg.setButton2("Feedback (WhatsApp)", function()
+        local ok = pcall(function()
+            local intent = Intent(Intent.ACTION_VIEW)
+            intent.setData(Uri.parse("https://wa.me/923145406759"))
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            this.startActivity(intent)
+        end)
+        if not ok then
+            service.speak("WhatsApp nahi khul saka, number hai: 03145406759")
+        end
+    end)
+    dlg.show()
+end
+
+-- ===== User Guide (Next / Previous, ek ek feature) =====
+function MP.showGuidePage(idx)
+    local items = MP.userGuideItems
+    local total = #items
+    if idx < 1 then idx = 1 end
+    if idx > total then idx = total end
+    local item = items[idx]
+
+    local dlg = LuaDialog(this)
+    dlg.setTitle("(" .. idx .. "/" .. total .. ") " .. item.title)
+    dlg.setMessage(item.description)
+
+    if idx < total then
+        dlg.setButton("Next", function() MP.showGuidePage(idx + 1) end)
+    else
+        dlg.setButton("OK, Wapas Jayein", function() MP.showAboutSupport() end)
+    end
+
+    if idx > 1 then
+        dlg.setButton2("Previous", function() MP.showGuidePage(idx - 1) end)
+    else
+        dlg.setButton2("Band Karein", function() MP.showAboutSupport() end)
+    end
+
+    dlg.show()
+end
+
+btnAbout.onClick = function()
+    MP.showAboutSupport()
+end
+
+btnExitApp.onClick = function()
+    if MP.player ~= nil then
+        pcall(function() MP.player.stop() end)
+        pcall(function() MP.player.release() end)
+    end
+    MP.clearNowPlayingNotification()
+    activity.finish()
+end
+
+-- ===== Startup =====
+pcall(updateSongLabel)
+pcall(updatePlayPauseLabel)
+pcall(updateSkipLabels)
+
+service.speak("Music player khul raha hai, gaane scan ho rahe hain")
+runInBackground(function()
+    MP.scanMusic()
+    runOnUiThread(function()
+        updateSongLabel()
+    end)
 end)
